@@ -1,0 +1,3 @@
+Original model:
+/media/nvme/kiran/smudl_trained_models/experiment_9/trained_models/model.best.weights.lr_0.0001_dr_0.0.hdf5
+/media/nvme/kiran/smudl_trained_models/experiment_9/trained_models/model.best.architecture.lr_0.0001_dr_0.0.json
