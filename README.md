@@ -13,7 +13,7 @@ VarNet is a pre-trained deep learning model trained on vast amounts of next gene
  -->
 
 ## Requirements
-VarNet has been tested with python3.7, it may run without issues on other versions of python3. After cloning the repository, you can install the required libraries using the following command in the root of the repo:
+VarNet has been tested with python3.7, it may run without issues on other versions of python3. After downloading the latest release [here](https://github.com/skandlab/VarNet/releases), you can install the required libraries using the following command in the root of the repo:
 
 ```
 pip install -r requirements.txt 
