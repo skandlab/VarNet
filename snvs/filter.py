@@ -285,4 +285,4 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, out
         for pos in candidates:
             f.write('%s\t%s\n' % (pos[0], pos[1]))
 
-    print(('COMPLETED BATCH: ', output_file)) 
+    print(('COMPLETED SNV BATCH: ', output_file)) 

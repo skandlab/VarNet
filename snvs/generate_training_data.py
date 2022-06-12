@@ -41,7 +41,6 @@ import snvs.constants as c
 import datetime
 import random
 
-from snvs.compress_npy_helper import save_compressed_npy, load_compressed_npy
 from utils import sample_reads_fn
 
 # === FUNCTIONS FOR RUNNING PROGRAM IN COMMAND LINE ===
@@ -869,6 +868,7 @@ def parse_predictions_file(predictions_path, args, is_smurf=False, is_goldset=Fa
     return balanced_positions_to_generate
 
 if __name__ == '__main__':
+    from snvs.compress_npy_helper import save_compressed_npy, load_compressed_npy
     if args.generate_all == 'no':
 
         TIME = time()

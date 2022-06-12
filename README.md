@@ -40,7 +40,7 @@ docker run -it --rm -v /data:/pikachu -w /varnet kiranchari/varnet:latest python
 --sample_name dream1 \
 --normal_bam /pikachu/dream1_normal.bam \
 --tumor_bam /pikachu/dream1_tumor.bam \
---processes 8 \
+--processes 2 \
 --output_dir /pikachu/varnet \
 --reference /pikachu/GRCh37.fa \
 --region_bed /pikachu/region.bed (optional)
@@ -65,7 +65,7 @@ python filter.py \
     --sample_name dream1 \
     --normal_bam dream1_normal.bam \
     --tumor_bam dream1_tumor.bam \
-    --processes 6 \
+    --processes 2 \
     --output_dir varnet_outputs \
     --reference GRCh38.fa \
     --region_bed region.bed (optional)
@@ -78,7 +78,7 @@ python predict.py \
 	--sample_name dream1 \
 	--normal_bam dream1_normal.bam \
 	--tumor_bam dream1_tumor.bam \
-	--processes 6 \
+	--processes 2 \
 	--output_dir varnet_outputs \
 	--reference GRCh38.fa \
 	-snv (optional flag, for snv calling only)

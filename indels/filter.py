@@ -75,10 +75,6 @@ if __name__ == '__main__':
 else:
     load_constants()  
 
-# all imports that depend on constants.py (e.g. on c.path_to_smudl) go here
-from .analyze_candidates import analyze
-
-
 # === PROGRAM HELPERS === #
 
 def get_total_coverage(bamfile, chrX, position):
@@ -614,7 +610,8 @@ def get_candidates_folder(data_name, num_nodes, postprocessing=False):
 # === EXECUTE MAIN === #
 
 if __name__ == '__main__':
-    
+    from .analyze_candidates import analyze
+ 
     TIME = time()
     print("\nPREFILTER SETTINGS:")
     for setting in c.PREFILTER_SETTINGS:

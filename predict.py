@@ -413,6 +413,8 @@ def main():
             print(("Number of SNV candidates: ", len(snv_candidates)))
 
             snv_candidate_batches = np.array_split(snv_candidates, split_num)
+            # remove empty batches
+            snv_candidate_batches = [_ for _ in snv_candidate_batches if len(_)]
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder) for idx, batch in enumerate(snv_candidate_batches) )
@@ -446,6 +448,8 @@ def main():
             print(("Number of INDEL candidates: ", len(indel_candidates)))
 
             indel_candidate_batches = np.array_split(indel_candidates, split_num)
+            # remove empty batches
+            indel_candidate_batches = [_ for _ in indel_candidate_batches if len(_)]
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder) for idx, batch in enumerate(indel_candidate_batches) )
