@@ -5,7 +5,7 @@ VarNet is a pre-trained deep learning model trained on vast amounts of next gene
 ![VarNet summary](varnet.png)
 
 ## Publication
-If you find VarNet useful for your work, please consider citing the paper.
+If you use VarNet in your work, please cite this paper:
 
 Krishnamachari, K., Lu, D., Swift-Scott, A. et al. Accurate somatic variant detection using weakly supervised deep learning. Nat Commun 13, 4248 (2022). https://doi.org/10.1038/s41467-022-31765-8
 
