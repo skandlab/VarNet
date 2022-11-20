@@ -54,13 +54,13 @@ You may follow the example usage below for further details on running VarNet.
 
 ## Example Usage
 
-Please make sure all .bam/.fa files are indexed and their respective indices are present in the same directory. Varnet was tested with BAM files that were aligned using BWA. Duplicate reads were marked and removed. We recommend the same preprocessing before running Varnet. Varnet does not perform realignment around INDELs so we recommend using GATK3 before running variant calling. 
+Please make sure all .bam/.fa files are indexed and their respective indices are present in the same directory. VarNet was tested with BAM files that were aligned using BWA. Duplicate reads were marked and removed. We recommend the same preprocessing before running Varnet. VarNet does not perform realignment around INDELs so we recommend using GATK3 before running variant calling. 
 
 VarNet will save all output to its output directory **output\_dir**. **sample\_name** is the name of the sample being run and must be consistent when running filter.py and predict.py   
 
-If **region\_bed** is not provided, VarNet will scan all regions in the provided **reference** file. 
+If **region\_bed** is not provided, VarNet will scan all regions in the provided **reference** genome file. 
 
-By default, VarNet will scan for both SNV and INDEL candidates. To scan for only SNV or INDEL candidates, use the **-snv** and **-indel**, respectively. If you choose to use this flag, please use it for both filtering as well as prediction.
+By default, VarNet will scan and predict both SNV and INDELs. To scan and predict only SNV or only INDELs, use the **-snv** and **-indel** flags, respectively. If you choose to use this flag, please use it during both filtering as well as prediction.
 
 1. Filter step to find candidates across genome
 ```
