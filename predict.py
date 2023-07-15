@@ -78,7 +78,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 ##FORMAT=<ID=RO,Number=1,Type=Integer,Description="Reference allele observation count in the tumor">
 ##FORMAT=<ID=AO,Number=A,Type=Integer,Description="Alternate allele observation count in the tumor">
 ##FORMAT=<ID=AF,Number=1,Type=Float,Description="Allele fractions of alternate alleles in the tumor">
-#CHROM  POS ID  REF ALT QUAL    FILTER  INFO    FORMAT  SAMPLE\n""" % (fileDate, c.__VERSION__, args.reference, args.normal_bam, args.tumor_bam)
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n""" % (fileDate, c.__VERSION__, args.reference, args.normal_bam, args.tumor_bam)
 
     vcf_write.write(vcf_header)
 
