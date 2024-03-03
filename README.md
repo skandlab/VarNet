@@ -39,14 +39,14 @@ What's inside the Docker image?
 Example Docker Usage:
 
 ```
-docker run -it --rm -v /data:/pikachu -w /varnet kiranchari/varnet:latest python filter.py \
+docker run -it --rm -v /data:/pikachu -w /VarNet kiranchari/varnet:latest /bin/bash -c "git pull; python filter.py \
 --sample_name dream1 \
 --normal_bam /pikachu/dream1_normal.bam \
 --tumor_bam /pikachu/dream1_tumor.bam \
 --processes 2 \
 --output_dir /pikachu/varnet \
 --reference /pikachu/GRCh37.fa \
---region_bed /pikachu/region.bed (optional)
+--region_bed /pikachu/region.bed (optional)"
 ```
 Please replace the path to the host data directory, i.e. /data, with your data path. The docker image has also been tested with Singularity (https://singularity.lbl.gov/). For e.g. run "singularity pull varnet.sif docker://kiranchari/varnet:latest" to save as a Singularity image. 
 
