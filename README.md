@@ -90,6 +90,9 @@ python predict.py \
 
 In this example the VarNet output VCF file will be saved to `varnet_outputs/dream1/dream1.vcf`.
 
+## VarNet Benchmarking Guidance
+We recommend including all variant calls from VarNet's VCF output, not just those marked "PASS," when creating precision-recall curves. The "PASS" designation was determined by a score threshold of 0.5, but using all calls provides a more complete picture of the model's performance across all possible thresholds.
+
 # License
 
 Shield: [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
