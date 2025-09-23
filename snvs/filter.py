@@ -175,114 +175,204 @@ def goldset_pre_filters(sample_name, bamname_n, bamname_t, chrom, start, end, ba
 
 def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, output_filename=None):
 
+    # added constant defintions for better readability and efficiency
+    MIN_BQ = c.MIN_BASE_QUALITY
+    MIN_COV = c.MIN_COVERAGE
+    MIN_AF_T = c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
+    MIN_AR_T = c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
+    MAX_AF_N = c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
+
     output_file = os.path.join(candidates_folder, 'batch_%s.csv' % str(batch_num) )
 
     if os.path.exists(output_file):
         print(("SNV BATCH COMPELTE:", output_file))
         return
 
-    regiontime = time()
     bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
     bamfile_t = pysam.AlignmentFile(bamname_t, 'rb')
 
-    candidates = []
-
-    for region in regions:
-        chrom, start, end = region[0], region[1], region[2]
-
-        try:
-            coverage_n = bamfile_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
-        except ValueError:
-            if chrom == 'MT':
-                # MT is chrM in hg19
-                chrom = 'chrM'
-            else:
-                chrom = 'chr%s' % chrom
-
+    with open(output_file, "a") as f:
+        for chrom, start, end in regions:
             try:
-                coverage_n = bamfile_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+                coverage_n = bamfile_n.count_coverage(chrom, start, end + 1,
+                                           quality_threshold=MIN_BQ,
+                                           read_callback=check_read)
             except ValueError:
-                print("Region does not exist in normal BAM")
-                return
-
-        try:
-            coverage_t = bamfile_t.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
-        except ValueError:
-            if chrom == 'MT':
-                # MT is chrM in hg19
-                chrom = 'chrM'
-            else:
-                chrom = 'chr%s' % chrom
-
-            try:        
-                coverage_t = bamfile_t.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+                # map MT→chrM or add 'chr' prefix and retry
+                alt_chrom = 'chrM' if chrom == 'MT' else (f'chr{chrom}' if not str(chrom).startswith('chr') else chrom)
+                try:
+                    coverage_n = bamfile_n.count_coverage(alt_chrom, start, end + 1,
+                                               quality_threshold=MIN_BQ,
+                                               read_callback=check_read)
+                    chrom = alt_chrom
+                except ValueError:
+                    print("Region does not exist in normal BAM")
+                    return
+            
+            try:
+                coverage_t = bamfile_t.count_coverage(chrom, start, end + 1,
+                                           quality_threshold=MIN_BQ,
+                                           read_callback=check_read)
             except ValueError:
-                print("Region does not exist in tumor BAM")
-                return
+                alt_chrom = 'chrM' if chrom == 'MT' else (f'chr{chrom}' if not str(chrom).startswith('chr') else chrom)
+                try:
+                    coverage_t = bamfile_t.count_coverage(alt_chrom, start, end + 1,
+                                               quality_threshold=MIN_BQ,
+                                               read_callback=check_read)
+                    chrom = alt_chrom
 
-        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
-        coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
-            for i in range(len(coverage_n[0]))]
-        del coverage_n
+                except ValueError:
+                    print("Region does not exist in tumor BAM")
+                    return
 
-        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in tumor
-        coverage_list_t = [(coverage_t[0][i], coverage_t[1][i], coverage_t[2][i], coverage_t[3][i]) 
-            for i in range(len(coverage_t[0]))]
-        
-        del coverage_t
-
-        gc.collect()
-
-        map_dict = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
-        
-        for i in range(len(coverage_list_n)):
-
-            pos_key = 'chrom%spos%d' % (chrom, start+i)
-
-            coverage_of_normal = sum(coverage_list_n[i])
-            coverage_of_tumor = sum(coverage_list_t[i])
-
-            # Skip if either normal or tumor coverage is low
-            if coverage_of_normal < c.MIN_COVERAGE or coverage_of_tumor < c.MIN_COVERAGE:
+            # shape is now (4, L). Four nucleotides in order A, C, G, T.
+            coverage_list_n = np.vstack(coverage_n).astype(np.int32, copy=False)
+            coverage_list_t = np.vstack(coverage_t).astype(np.int32, copy=False)
+            # length of region (number of positions)
+            L = coverage_list_n.shape[1]  
+            if L == 0:
                 continue
 
-            # see if a variant allele is found with more than threshold frequency in tumor
-            # assuming homozygosity
-            max_frequency_base_in_normal = max(enumerate( coverage_list_n[i] ), key=operator.itemgetter(1))
+            # total coverages per position
+            coverage_per_pos_n = coverage_list_n.sum(axis=0)  # (L,)
+            coverage_per_pos_t = coverage_list_t.sum(axis=0)  # (L,)
 
-            is_candidate_position = False
+            # minimum coverage in BOTH normal and tumor
+            cov_mask = (coverage_per_pos_n >= MIN_COV) & (coverage_per_pos_t >= MIN_COV)
+            if not np.any(cov_mask):
+                continue
+            
+            # build an alt mask: True where base != reference at each position
+            max_frequency_base_in_normal = coverage_list_n.argmax(axis=0)
+            idx_rows = np.arange(4)[:, None]      # (4,1)
+            alt_mask = (idx_rows != max_frequency_base_in_normal[None, :])  # (4,L)
 
-            """
-               Filter positions where no alternate allele has freq > c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
-               Filter positions where no alterate allele has more than 2 supporting reads
-               Filter positions where no alternate allele is found in the normal sample with frequency less than c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL    
-            """
+            # This is just a check to make sure the denominators are always >= 1
+            cov_n_safe = np.where(coverage_per_pos_n == 0, 1, coverage_per_pos_n)
+            cov_t_safe = np.where(coverage_per_pos_t == 0, 1, coverage_per_pos_t)
 
-            for j in range(len(coverage_list_t[i])):
+            alt_freq_t = coverage_list_t / cov_t_safe  # tumor allelle frequecy
+            alt_reads_t = coverage_list_t              # tumor read counts
+            alt_freq_n = coverage_list_n / cov_n_safe  # normal allele frequency
 
-                if j != max_frequency_base_in_normal[0]:
-                    # checking alternate alleles in tumor
+            # per-base conditions (only meaningful for alt bases)
+            tumor_alt_allele_frequency_high    = alt_freq_t >= MIN_AF_T
+            tumor_alt_allele_read_count_high = alt_reads_t >= MIN_AR_T
+            normal_alt_allele_frequency_low    = alt_freq_n <= MAX_AF_N
 
-                    allele_frequency_high = (coverage_list_t[i][j] / coverage_of_tumor) >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR        
-                    allele_read_count_high = coverage_list_t[i][j] >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
-                    allele_frequency_low_in_normal = (coverage_list_n[i][j] / coverage_of_normal) <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
+            alternate_allele_passes_per_base     = (
+                alt_mask
+                & tumor_alt_allele_frequency_high
+                & tumor_alt_allele_read_count_high
+                & normal_alt_allele_frequency_low
+            )  # (4,L)
+
+            min_coverage_met_in_both_samples     = cov_mask  
+            any_alt_passes = alternate_allele_passes_per_base.any(axis=0) & min_coverage_met_in_both_samples
+
+            idx = np.nonzero(any_alt_passes)[0]
+            if idx.size:
+                out = '\n'.join(f'{chrom}\t{start + int(i)}' for i in idx) + '\n'
+                f.write(out)
+
+        print(('COMPLETED SNV BATCH: ', output_file))
+
+    # for region in regions:
+    #     chrom, start, end = region[0], region[1], region[2]
+
+    #     try:
+    #         coverage_n = bam_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+    #     except ValueError:
+    #         if chrom == 'MT':
+    #             # MT is chrM in hg19
+    #             chrom = 'chrM'
+    #         else:
+    #             chrom = 'chr%s' % chrom
+
+    #         try:
+    #             coverage_n = bam_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+    #         except ValueError:
+    #             print("Region does not exist in normal BAM")
+    #             return
+
+    #     try:
+    #         coverage_t = bam_t.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+    #     except ValueError:
+    #         if chrom == 'MT':
+    #             # MT is chrM in hg19
+    #             chrom = 'chrM'
+    #         else:
+    #             chrom = 'chr%s' % chrom
+
+    #         try:        
+    #             coverage_t = bam_t.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+    #         except ValueError:
+    #             print("Region does not exist in tumor BAM")
+    #             return
+
+    #     # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
+    #     coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
+    #         for i in range(len(coverage_n[0]))]
+    #     del coverage_n
+
+    #     # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in tumor
+    #     coverage_list_t = [(coverage_t[0][i], coverage_t[1][i], coverage_t[2][i], coverage_t[3][i]) 
+    #         for i in range(len(coverage_t[0]))]
+        
+    #     del coverage_t
+
+    #     gc.collect()
+
+    #     map_dict = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+        
+    #     for i in range(len(coverage_list_n)):
+
+    #         pos_key = 'chrom%spos%d' % (chrom, start+i)
+
+    #         coverage_of_normal = sum(coverage_list_n[i])
+    #         coverage_of_tumor = sum(coverage_list_t[i])
+
+    #         # Skip if either normal or tumor coverage is low
+    #         if coverage_of_normal < c.MIN_COVERAGE or coverage_of_tumor < c.MIN_COVERAGE:
+    #             continue
+
+    #         # see if a variant allele is found with more than threshold frequency in tumor
+    #         # assuming homozygosity
+    #         max_frequency_base_in_normal = max(enumerate( coverage_list_n[i] ), key=operator.itemgetter(1))
+
+    #         is_candidate_position = False
+
+    #         """
+    #            Filter positions where no alternate allele has freq > c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
+    #            Filter positions where no alterate allele has more than 2 supporting reads
+    #            Filter positions where no alternate allele is found in the normal sample with frequency less than c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL    
+    #         """
+
+    #         for j in range(len(coverage_list_t[i])):
+
+    #             if j != max_frequency_base_in_normal[0]:
+    #                 # checking alternate alleles in tumor
+
+    #                 allele_frequency_high = (coverage_list_t[i][j] / coverage_of_tumor) >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR        
+    #                 allele_read_count_high = coverage_list_t[i][j] >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
+    #                 allele_frequency_low_in_normal = (coverage_list_n[i][j] / coverage_of_normal) <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
                 
-                    is_potential_mutation = allele_frequency_high and allele_read_count_high and allele_frequency_low_in_normal
+    #                 is_potential_mutation = allele_frequency_high and allele_read_count_high and allele_frequency_low_in_normal
 
-                    if is_potential_mutation:
-                        is_candidate_position = True
-                        break
+    #                 if is_potential_mutation:
+    #                     is_candidate_position = True
+    #                     break
 
-            if is_candidate_position:
-                candidates.append((chrom, start + i))
+    #         if is_candidate_position:
+    #             candidates.append((chrom, start + i))
 
     # create folder for batches for this sample
     #if not os.path.exists(os.path.join(c.filtering_folder, c.filtering_batches_folder, sample_name)):
     #    os.makedirs(os.path.join(c.filtering_folder, c.filtering_batches_folder, sample_name))
 
     # save batch.csv
-    with open(output_file, 'a') as f:
-        for pos in candidates:
-            f.write('%s\t%s\n' % (pos[0], pos[1]))
+    # with open(output_file, 'a') as f:
+    #     for pos in candidates:
+    #         f.write('%s\t%s\n' % (pos[0], pos[1]))
 
-    print(('COMPLETED SNV BATCH: ', output_file)) 
+    # print(('COMPLETED SNV BATCH: ', output_file)) 
