@@ -175,107 +175,118 @@ def goldset_pre_filters(sample_name, bamname_n, bamname_t, chrom, start, end, ba
 
 def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, output_filename=None):
 
-    # added constant defintions for better readability and efficiency
-    MIN_BQ = c.MIN_BASE_QUALITY
+    # constants
+    MIN_BQ  = c.MIN_BASE_QUALITY
     MIN_COV = c.MIN_COVERAGE
     MIN_AF_T = c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
     MIN_AR_T = c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
     MAX_AF_N = c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
 
-    output_file = os.path.join(candidates_folder, 'batch_%s.csv' % str(batch_num) )
+    output_file = os.path.join(candidates_folder, f"batch_{batch_num}.csv")
 
     if os.path.exists(output_file):
-        print(("SNV BATCH COMPELTE:", output_file))
+        print("SNV BATCH COMPLETE:", output_file)
         return
 
-    bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
-    bamfile_t = pysam.AlignmentFile(bamname_t, 'rb')
+    # t0 = now()
+    bamfile_n = pysam.AlignmentFile(bamname_n, "rb")
+    bamfile_t = pysam.AlignmentFile(bamname_t, "rb")
+
+    total_positions = 0
+    total_alt_candidates = 0
+    total_skipped_cov = 0
+    total_ties = 0
 
     with open(output_file, "a") as f:
         for chrom, start, end in regions:
             try:
-                coverage_n = bamfile_n.count_coverage(chrom, start, end + 1,
-                                           quality_threshold=MIN_BQ,
-                                           read_callback=check_read)
+                coverage_n = bamfile_n.count_coverage(
+                    chrom, start, end + 1, quality_threshold=MIN_BQ, read_callback=check_read
+                )
             except ValueError:
-                # map MT→chrM or add 'chr' prefix and retry
-                alt_chrom = 'chrM' if chrom == 'MT' else (f'chr{chrom}' if not str(chrom).startswith('chr') else chrom)
+                alt_chrom = "chrM" if chrom == "MT" else (f"chr{chrom}" if not str(chrom).startswith("chr") else chrom)
                 try:
-                    coverage_n = bamfile_n.count_coverage(alt_chrom, start, end + 1,
-                                               quality_threshold=MIN_BQ,
-                                               read_callback=check_read)
+                    coverage_n = bamfile_n.count_coverage(
+                        alt_chrom, start, end + 1, quality_threshold=MIN_BQ, read_callback=check_read
+                    )
                     chrom = alt_chrom
                 except ValueError:
-                    print("Region does not exist in normal BAM")
-                    return
-            
+                    print(f"[WARN] Region {chrom}:{start}-{end} missing in normal BAM")
+                    continue
+
             try:
-                coverage_t = bamfile_t.count_coverage(chrom, start, end + 1,
-                                           quality_threshold=MIN_BQ,
-                                           read_callback=check_read)
+                coverage_t = bamfile_t.count_coverage(
+                    chrom, start, end + 1, quality_threshold=MIN_BQ, read_callback=check_read
+                )
             except ValueError:
-                alt_chrom = 'chrM' if chrom == 'MT' else (f'chr{chrom}' if not str(chrom).startswith('chr') else chrom)
+                alt_chrom = "chrM" if chrom == "MT" else (f"chr{chrom}" if not str(chrom).startswith("chr") else chrom)
                 try:
-                    coverage_t = bamfile_t.count_coverage(alt_chrom, start, end + 1,
-                                               quality_threshold=MIN_BQ,
-                                               read_callback=check_read)
+                    coverage_t = bamfile_t.count_coverage(
+                        alt_chrom, start, end + 1, quality_threshold=MIN_BQ, read_callback=check_read
+                    )
                     chrom = alt_chrom
-
                 except ValueError:
-                    print("Region does not exist in tumor BAM")
-                    return
+                    print(f"[WARN] Region {chrom}:{start}-{end} missing in tumor BAM")
+                    continue
 
-            # shape is now (4, L). Four nucleotides in order A, C, G, T.
             coverage_list_n = np.vstack(coverage_n).astype(np.int32, copy=False)
             coverage_list_t = np.vstack(coverage_t).astype(np.int32, copy=False)
-            # length of region (number of positions)
-            L = coverage_list_n.shape[1]  
+            L = coverage_list_n.shape[1]
             if L == 0:
                 continue
 
-            # total coverages per position
-            coverage_per_pos_n = coverage_list_n.sum(axis=0)  # (L,)
-            coverage_per_pos_t = coverage_list_t.sum(axis=0)  # (L,)
+            total_positions += L
 
-            # minimum coverage in BOTH normal and tumor
+            coverage_per_pos_n = coverage_list_n.sum(axis=0)
+            coverage_per_pos_t = coverage_list_t.sum(axis=0)
             cov_mask = (coverage_per_pos_n >= MIN_COV) & (coverage_per_pos_t >= MIN_COV)
-            if not np.any(cov_mask):
-                continue
-            
-            # build an alt mask: True where base != reference at each position
-            max_frequency_base_in_normal = coverage_list_n.argmax(axis=0)
-            idx_rows = np.arange(4)[:, None]      # (4,1)
-            alt_mask = (idx_rows != max_frequency_base_in_normal[None, :])  # (4,L)
+            total_skipped_cov += np.sum(~cov_mask)
 
-            # This is just a check to make sure the denominators are always >= 1
+            # --- tie-aware alt_mask patch ---
+            max_counts = coverage_list_n.max(axis=0)
+            ref_mask = coverage_list_n == max_counts   # handle multiallelic ties
+            alt_mask = ~ref_mask
+
+            # count tie positions for diagnostics
+            ties = (coverage_list_n == max_counts).sum(axis=0) > 1
+            total_ties += np.sum(ties)
+
+            # guard against zero coverage
             cov_n_safe = np.where(coverage_per_pos_n == 0, 1, coverage_per_pos_n)
             cov_t_safe = np.where(coverage_per_pos_t == 0, 1, coverage_per_pos_t)
 
-            alt_freq_t = coverage_list_t / cov_t_safe  # tumor allelle frequecy
-            alt_reads_t = coverage_list_t              # tumor read counts
-            alt_freq_n = coverage_list_n / cov_n_safe  # normal allele frequency
+            # use float64 to avoid rounding-out tiny AFs
+            alt_freq_t = coverage_list_t.astype(np.float64) / cov_t_safe
+            alt_reads_t = coverage_list_t
+            alt_freq_n = coverage_list_n.astype(np.float64) / cov_n_safe
 
-            # per-base conditions (only meaningful for alt bases)
-            tumor_alt_allele_frequency_high    = alt_freq_t >= MIN_AF_T
-            tumor_alt_allele_read_count_high = alt_reads_t >= MIN_AR_T
-            normal_alt_allele_frequency_low    = alt_freq_n <= MAX_AF_N
+            # per-base filters
+            tumor_alt_AF_high = alt_freq_t >= MIN_AF_T
+            tumor_alt_AR_high = alt_reads_t >= MIN_AR_T
+            normal_alt_AF_low = alt_freq_n <= MAX_AF_N
 
-            alternate_allele_passes_per_base     = (
+            alt_pass = (
                 alt_mask
-                & tumor_alt_allele_frequency_high
-                & tumor_alt_allele_read_count_high
-                & normal_alt_allele_frequency_low
-            )  # (4,L)
-
-            min_coverage_met_in_both_samples     = cov_mask  
-            any_alt_passes = alternate_allele_passes_per_base.any(axis=0) & min_coverage_met_in_both_samples
-
+                & tumor_alt_AF_high
+                & tumor_alt_AR_high
+                & normal_alt_AF_low
+            )
+            any_alt_passes = alt_pass.any(axis=0) & cov_mask
             idx = np.nonzero(any_alt_passes)[0]
+            total_alt_candidates += idx.size
+
             if idx.size:
-                out = '\n'.join(f'{chrom}\t{start + int(i)}' for i in idx) + '\n'
+                out = "\n".join(f"{chrom}\t{start + int(i)}" for i in idx) + "\n"
                 f.write(out)
 
-        print(('COMPLETED SNV BATCH: ', output_file))
+        print(
+            f"[DEBUG] Processed {total_positions} positions; "
+            f"skipped(low cov): {total_skipped_cov}; "
+            f"ties in normal: {total_ties}; "
+            f"alt candidates written: {total_alt_candidates}"
+        )
+        print(f"COMPLETED SNV BATCH: {output_file}")
+
 
     # for region in regions:
     #     chrom, start, end = region[0], region[1], region[2]
