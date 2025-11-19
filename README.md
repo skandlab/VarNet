@@ -58,6 +58,8 @@ Please make sure all .bam/.fa files are indexed and their respective indices are
 
 VarNet will save all output to its output directory **output\_dir**. **sample\_name** is the name of the sample being run and must be consistent when running filter.py and predict.py   
 
+📝 **Note: VarNet can resume jobs that were stopped or interrupted. If you re-run the script with the same input and output directory, VarNet will automatically detect intermediate output files and pick up where it left off, so there is no need to delete outputs from a previous run.**
+
 If **region\_bed** is not provided, VarNet will scan all regions in the provided **reference** genome file. 
 
 By default, VarNet will scan and predict both SNV and INDELs. To scan and predict only SNV or only INDELs, use the **-snv** and **-indel** flags, respectively. If you choose to use this flag, please use it during both filtering as well as prediction.
