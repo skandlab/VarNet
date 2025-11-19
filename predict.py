@@ -103,7 +103,11 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
         # filter site if there exists a germline variant with AF > 0.1 AND it overlaps with the somatic site of interest
         for site in check_sites:
-            snp=get_snv(chrom, site, bamfile_n, ref_file)
+            try:
+                snp=get_snv(chrom, site, bamfile_n, ref_file)
+            except ValueError:
+                # end of chromosome, skip site
+                continue
             indel=get_indels(chrom, site, bamfile_n, ref_file)
 
             snp_AF, indel_AF = snp[-1], indel[-1]
