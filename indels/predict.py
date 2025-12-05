@@ -103,11 +103,7 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
 
     if not training:
         y_pred_test = model.predict(input_tensor)
-        
-        if c.MULTIPLE_READ_SAMPLES:
-            return np.mean(y_pred_test)
-
-        return y_pred_test
+        return np.mean(y_pred_test)
     else:
         # to update batch norm statistics
         y_pred_test = model(input_tensor, training=True)
