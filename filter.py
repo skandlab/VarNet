@@ -6,9 +6,11 @@ from joblib import Parallel, delayed
 import snvs.constants as c
 import os
 import argparse
+import sys
 
-from snvs.filter import filter_snvs
-from indels.filter import filter_indels
+from utils import load_npz
+from snvs.filter import filter_snvs, ffpe_filter_snvs
+from indels.filter import filter_indels, ffpe_filter_indels
 
 def concat_csv_files(filtering_batches_folder):
     combined_positions_file = os.path.join(filtering_batches_folder, c.filtered_positions_file) 
@@ -24,9 +26,7 @@ def concat_csv_files(filtering_batches_folder):
         for batch in batch_files:
             with open(os.path.join(filtering_batches_folder, batch)) as r:
                 for line in r:
-                    line = line.strip()
-                    chrom, pos = line.split('\t')[0], line.split('\t')[1]
-                    f.write('%s\t%s\n' % (chrom, pos))
+                    f.write(line)
 
     # delete the batches
     for batch in batch_files:
@@ -34,31 +34,6 @@ def concat_csv_files(filtering_batches_folder):
 
     print(("Candidates file: %s" % combined_positions_file))
     return combined_positions_file
-
-
-def split_chrom(chrom_range, args):
-    cpu_count = 10 # split it into a fixed numbers of batches
-    
-    chunk_length = int((chrom_range[2]+1)/cpu_count)
-
-    if chunk_length == 0:
-        return [chrom_range]
-
-    start, end = 0, chunk_length - 1
-    new_ranges = [(chrom_range[0], start, end)]
-    done=False
-    
-    while not done:
-        start = start + chunk_length
-        end = end + chunk_length
-
-        if end >= chrom_range[2]:
-            done = True
-            end = chrom_range[2]
-
-        new_ranges += [(chrom_range[0], start, end)]
-
-    return new_ranges
 
 def create_folder(folder):
     if not os.path.exists(folder):
@@ -68,34 +43,6 @@ def create_folder(folder):
             # folder may have been created in another process at the same time
             pass
 
-def filter_candidates(args, snv_candidates_folder, indel_candidates_folder, bamname_n, bamname_t, regions, batch_num):
-    snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
-
-    if not args.indel: # if not indel_only
-        if os.path.exists(snv_candidates_file):
-            print(("SNV candidates already generated. Delete folder to re-run:", snv_candidates_folder))
-        else:
-            filter_snvs(snv_candidates_folder, bamname_n, bamname_t, regions, batch_num)
-
-    indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
-
-    if not args.snv: # if not snv_only
-        if os.path.exists(indel_candidates_file):
-            print(("INDEL candidates already generated. Delete folder to re-run:", indel_candidates_folder))
-        else:
-            output = filter_indels(indel_candidates_folder, bamname_n, bamname_t, regions, batch_num)
-        
-            if args.path_to_trues:
-                outfile = args.path_to_trues + '.stats.npy'
-                if os.path.exists(outfile):
-                    data=np.load(outfile)
-                    TRUE_FREQS, TRUE_MQS = list(data[0]),list(data[1])
-                    TRUE_FREQS.extend(output[0])
-                    TRUE_MQS.extend(output[1])
-                    np.save(outfile, [TRUE_FREQS, TRUE_MQS])
-                else:
-                    np.save(outfile, output)
-    
 def parse_bed(bed_file, limit_per_batch=1000000):
     """
     returns a list
@@ -130,6 +77,164 @@ def parse_bed(bed_file, limit_per_batch=1000000):
 
     return batches
 
+def split_chrom(chrom_range, args):
+    cpu_count = 10 # split it into a fixed numbers of batches
+    
+    chunk_length = int((chrom_range[2]+1)/cpu_count)
+
+    if chunk_length == 0:
+        return [chrom_range]
+
+    start, end = 0, chunk_length - 1
+    new_ranges = [(chrom_range[0], start, end)]
+    done=False
+    
+    while not done:
+        start = start + chunk_length
+        end = end + chunk_length
+
+        if end >= chrom_range[2]:
+            done = True
+            end = chrom_range[2]
+
+        new_ranges += [(chrom_range[0], start, end)]
+
+    return new_ranges
+
+def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed):
+    """
+    filter any somatic variant candidate overlapping any dbSNP COMMON variant
+    dbSNP_variants_0_indexed
+    """
+    candidates_file = open(path_to_candidates)
+    filtered_candidates_count = 0
+    filtered_candidates_file = path_to_candidates.replace('.csv', '.dbSNP.filtered.csv')
+    out = open(filtered_candidates_file, 'w')
+    
+    for line in candidates_file:
+        s=line.strip().split()
+        CHROM, POS, REF, ALT = s[0], int(s[1]), s[2], s[3] # position is 0-indexed in candidates file
+
+        # Note: To support GRch37, will need to map chromosome names from the fasta file version (e.g. 1, 2, 3, GL000231.1, MT) to (chr1, chr2, chrUn_gl000231, chrM) to match what the dbSNP dictionary is using
+
+        # pos_key = '%spos%s' % (CHROM, POS) # for build 155
+        pos_key = f'CHROM{CHROM}POS{POS}' # 0-indexed pos, for build 156
+        # pos_key = f'CHROM{CHROM}POS{POS}REF{REF}ALT{ALT}' # 0-indexed pos, for build 156
+        
+        if pos_key in dbSNP_variants_0_indexed:
+            filtered_candidates_count += 1
+        else:
+            out.write(line)
+
+    out.close()
+    os.remove(path_to_candidates)
+    os.rename(filtered_candidates_file, path_to_candidates)
+
+    print('dbSNP filtered variants count:', filtered_candidates_count)
+    print('Saved dbSNP filtered variant candidates:', path_to_candidates)
+
+def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed):
+    """
+    filter any somatic variant candidate overlapping any gnomAD PASS variant AF > 0
+    """
+    candidates_file = open(path_to_candidates)
+    filtered_candidates_count = 0
+    filtered_candidates_file = path_to_candidates.replace('.csv', '.gnomAD.filtered.csv')
+    
+    out = open(filtered_candidates_file, 'w')
+    
+    for line in candidates_file:
+        s=line.strip().split()
+        chrom, pos, REF, ALT = s[0], int(s[1]), s[2], s[3] # position is 0-indexed in candidates file
+
+        # pos_key = 'CHROM%sPOS%d' % (chrom, pos+1) # convert to 1-indexed pos for gnomAD dict
+        pos_key = 'CHROM%sPOS%dREF%sALT%s' % (chrom, pos+1, REF, ALT) # convert to 1-indexed pos for gnomAD dict
+
+        if pos_key in gnomAD_variants_1_indexed:
+            filtered_candidates_count += 1
+        else:
+            out.write(line) # write 0-indexed position back to file
+
+    out.close()
+    os.remove(path_to_candidates)
+    os.rename(filtered_candidates_file, path_to_candidates)
+
+    print('gnomAD filtered variants count:', filtered_candidates_count)
+    print('Saved gnomAD filtered variant candidates:', path_to_candidates)
+
+def parse_germline_vcf(path):
+    """
+    returns dict of germline variant positions 0-indexed
+    """
+    if path.endswith('.gz'):
+        import gzip
+        f = gzip.open(path)
+    else:
+        f = open(path)
+    
+    germline_sites = {}
+
+    for line in f:
+        line = line.decode("utf-8") # convert bytes to string
+        line = line.strip()
+        if line.startswith('#'): continue 
+        chrom, pos = line.split()[0], int(line.split()[1])-1 # convert to 0-indexed
+
+        germline_sites['%spos%d' % (chrom, pos)] = True
+
+    f.close()
+    return germline_sites
+
+def germline_vcf_filter(path_to_candidates, germline_sites):
+    """
+    filter any somatic variant candidate overlapping any germline variant
+    """
+    candidates_file = open(path_to_candidates)
+    filtered_candidates_count = 0
+    filtered_candidates_file = path_to_candidates.replace('.csv', '.germline.filtered.csv')
+
+    if os.path.exists(filtered_candidates_file): os.remove(filtered_candidates_file)
+    
+    out = open(filtered_candidates_file, 'a')
+    
+    for line in candidates_file:
+        line=line.strip()
+        chrom, pos = line.split()[0], line.split()[1] # position is 0-indexed in candidates file
+
+        pos_key = '%spos%s' % (chrom, pos)
+        
+        if pos_key in germline_sites:
+            filtered_candidates_count += 1
+        else:
+            out.write('%s\t%s\n' % (chrom, pos))
+
+    out.close()
+    os.remove(path_to_candidates)
+    os.rename(filtered_candidates_file, path_to_candidates)
+
+    print('Number of filtered candidates:', filtered_candidates_count)
+    print('Saved germline-filtered variant candidates:', path_to_candidates)
+
+def filter_candidates(args, snv_candidates_folder, indel_candidates_folder, bamname_n, bamname_t, regions, batch_num):
+    snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
+
+    # need to re-define the ref_file here since it cannot be pickled by joblib in Parallel() call
+    ref_file = pysam.FastaFile(args.reference)
+
+    if not args.indel: # if not indel_only
+        if os.path.exists(snv_candidates_file):
+            pass#print(("SNV candidates already generated. Delete this folder to re-generate candidates:", snv_candidates_folder))
+        else:
+            filter_snvs(snv_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
+
+    indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+
+    if not args.snv: # if not snv_only
+        if os.path.exists(indel_candidates_file):
+            pass#print(("INDEL candidates already generated. Delete this folder to re-generate candidates:", indel_candidates_folder))
+        else:
+            output = filter_indels(indel_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
+        
 def main(sample_name, bamname_n, bamname_t, args, goldset=True):
 
     sample_folder = os.path.join(args.output_dir, sample_name)
@@ -175,6 +280,62 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
     if not args.indel: concat_csv_files(snv_candidates_folder)
     if not args.snv: concat_csv_files(indel_candidates_folder)
 
+    if args.germline_vcf:
+        print('Filtering provided germline variants: %s' % args.germline_vcf)
+        germline_sites = parse_germline_vcf(args.germline_vcf)
+        
+        snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
+        indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+
+        if not args.indel: germline_vcf_filter(snv_candidates_file, germline_sites)
+        if not args.snv: germline_vcf_filter(indel_candidates_file, germline_sites)
+
+        del germline_sites
+        
+    # dbSNP filtering for tumor-only mode
+    if not bamname_n and not args.no_gnomad_dbsnp:
+        # tumor-only mode, fetch dbSNP variant sites
+        if args.reference_build == 'grch37':
+            # Note: Grch37 currently not supported. To support GRch37, need to map chromosome names from the fasta file version (e.g. 1, 2, 3, GL000231.1, MT) to (chr1, chr2, chrUn_gl000231, chrM) to match what the dbSNP dictionary is using
+            dbSNP_variants_0_indexed = load_npz('GrCh37-dbSNP-common-variants-0-indexed.npz') # build 155
+        elif args.reference_build == 'grch38':
+            # dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-common-variants-0-indexed.npz') # build 155, {CHROM}pos{POS}
+            dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-build-156-common-variants-0-indexed-CHROMPOS.npz') # build 156, CHROM{CHROM}POS{POS}
+            # dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-build-156-common-variants-0-indexed.npz') # build 156, CHROM{CHROM}POS{POS}REF{REF}ALT{ALT}
+        else:
+            raise Exception('unrecognized reference build:', args.reference_build)
+
+        snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
+        indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+
+        if not args.indel: dbSNP_filtering(snv_candidates_file, dbSNP_variants_0_indexed)
+        if not args.snv: dbSNP_filtering(indel_candidates_file, dbSNP_variants_0_indexed)
+
+        del dbSNP_variants_0_indexed # delete to free up memory
+
+        # load gnomAD 
+        # gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.CHROMPOS.npz') # CHROMPOS: True
+        # gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.with_AF.npz') # CHROMPOSREFALT: AF, needs 100GB memory to load
+        gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.npz') # CHROMPOSREFALT: True
+        
+        if not args.indel: gnomAD_filtering(snv_candidates_file, gnomAD_variants_1_indexed)
+        if not args.snv: gnomAD_filtering(indel_candidates_file, gnomAD_variants_1_indexed)
+
+        del gnomAD_variants_1_indexed # delete to free up memory
+
+    if args.ffpe:
+        print('===> ADDITIONAL FFPE FILTERING <===')
+        snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
+        indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+        
+        if not args.indel:
+            # do SNV FFPE filtering
+            ffpe_filter_snvs(bamname_n, bamname_t, snv_candidates_file)       
+        
+        if not args.snv:
+            # indel FFPE filtering
+            ffpe_filter_indels(bamname_n, bamname_t, indel_candidates_file)
+ 
     print("============== FILTERING REGIONS COMPLETE ===============")
 
 def check_filtering(path_to_trues, sample_name):  
@@ -202,19 +363,27 @@ def parse_args():
     parser.add_argument('--processes', default=5, type=int)
     parser.add_argument('--sample_name', required=True)
     parser.add_argument('--path_to_trues', default=None)
-    parser.add_argument('--normal_bam', required=True)
+    parser.add_argument('--normal_bam', required=False, default=None)
     parser.add_argument('--tumor_bam', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--reference', required=True)
+    parser.add_argument('--reference_build', required=False, default='grch38', choices=['grch37', 'grch38'])
     parser.add_argument('--region_bed', required=False, default=None)
     parser.add_argument('-snv', action='store_true') # read as snv_only
     parser.add_argument('-indel', action='store_true') # read as indel_only
-
+    parser.add_argument('-ffpe', action='store_true') # ffpe sample
+    parser.add_argument('--germline_vcf', required=False, type=str, default=None)
+    parser.add_argument('--no_gnomad_dbsnp', action='store_true', help='do germline filtering using gnomad and dbsnp')
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
     
+    # if not args.normal_bam:
+    #     if not args.reference_build:
+    #         print('Please provide --reference_build ("grch37", "grch38") argument in tumor-only mode')
+    #         sys.exit()
+
     if args.path_to_trues:
         ### TRUE INDELS
         true_positions = {}

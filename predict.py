@@ -7,6 +7,7 @@ import joblib
 from joblib import Parallel, delayed, __version__
 import os
 import sys
+import gzip
 
 # Disable tf logging. 1 to filter out INFO logs, 2 to additionally filter out WARNING logs,
 # and 3 to additionally filter out ERROR logs
@@ -17,8 +18,9 @@ from utils import get_ref_file
 
 import snvs.constants as c
 from snvs.generate_training_data import get_ref_base
-from snvs.filter import check_read
+from snvs.filter import check_read, get_snv
 from snvs.predict import predict_snvs
+from indels.filter import get_indels
 from indels.predict import predict_indels
 
 def concatenate_batch_prediction_results(predictions_folder):
@@ -32,11 +34,19 @@ def concatenate_batch_prediction_results(predictions_folder):
     from os.path import isfile, join
 
     batch_prediction_files = [join(predictions_folder, f) for f in listdir(predictions_folder) if isfile(join(predictions_folder, f))]
+    
+    positions_predicted = {} # for de-duplicating prediction sites
 
-    for batch in batch_prediction_files:
-        p = pd.read_csv(batch, sep='\t', header=None, names=['chrom', 'pos', 'pred_true'])
-        p = p.drop_duplicates(subset=['chrom', 'pos'])
-        p.to_csv(prediction_results_file, sep='\t', index=False, encoding='utf-8', mode='a', header=False)
+    with open(prediction_results_file, 'w') as f:
+        for batch_file in batch_prediction_files:
+            with open(batch_file) as r:
+                for line in r:
+                    CHROM, POS = line.strip().split()[0], line.strip().split()[1]
+                    key = f'CHROM{CHROM}POS{POS}'
+                    
+                    if key not in positions_predicted:
+                        positions_predicted[key]=True
+                        f.write(line)
 
     for f in batch_prediction_files:
        os.remove(f)
@@ -46,20 +56,20 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
     ref_file = get_ref_file(args.reference)
 
-    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf')
+    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf.gz')
 
     if os.path.exists(output_vcf):
         print("VCF file exists for sample. Delete the VCF to re-generate in current output dir.")
         print(("VCF:", output_vcf))
         return
 
-    output_vcf = output_vcf.replace('.vcf', '.vcf.temp')
+    output_vcf = output_vcf.replace('.vcf.gz', '.temp.vcf.gz')
 
     if os.path.exists(output_vcf):
         # temp file exists, delete it
         os.remove(output_vcf)
 
-    vcf_write = open(output_vcf, 'a')
+    vcf_write = gzip.open(output_vcf, 'at')
 
     fileDate = datetime.now().strftime("%Y%B%d, %H:%M:%S")
 
@@ -84,17 +94,47 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
     ALLELES = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
     ALLELE_INDICES = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    
+    if args.threshold is not None:
+        CUT_OFF = args.threshold
+        print('>>> VCF minimum score threshold:', CUT_OFF)
 
-    CUT_OFF = 0.3
+    if args.ffpe:
+        # retain all calls from original args.vcf
+        CUT_OFF = 0
+    elif (not args.normal_bam):
+        # tumor-only 
+        CUT_OFF = 0
+    else:
+        # tumor-normal frozen
+        CUT_OFF = 0.3
 
-    bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False)
+    if args.normal_bam and not args.ffpe:
+        # don't use normal sample for ffpe (no need as initial variant calling should have removed germline filters, if normal bam available)
+        bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False)
+    else:
+        # tumor-only mode
+        bamfile_n = None
+
     bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb", check_sq=False)
 
+    def get_coverage(bamfile, chrom, ref_pos):
+        coverage = bamfile.count_coverage(chrom, ref_pos, ref_pos+1)#, quality_threshold=c.MIN_BASE_QUALITY, read_callback=check_read)
+
+        # [ (#A, #C, #G, #T) ] at each position in tumor
+        coverage_list = [(coverage[0][i], coverage[1][i], coverage[2][i], coverage[3][i])
+            for i in range(len(coverage[0]))]
+
+        assert len(coverage_list) == 1
+        coverage_list = coverage_list[0] # A C G T
+        coverage_list = list(coverage_list) # convert tuple to list
+        return coverage_list
+
     def germline_filter(chrom, ref_pos, bamfile_n, ref_file):
-        # return True if germlines variant (snp or indel) found in the neighboring 50bp region
+        # return True if germline variant (snp or indel) found in the neighboring region
         # search to the left of the site (and 1bp to the right), in order to check if there is an indel that overlaps the somatic site but begins in a prior position
-        margin = 1 # 1bp. reject a somatic site if there is a germline variant within this margin. 1bp default is based on bedtools subtract behavior
-        window = 10
+        margin = 0 # previously 1. reject a somatic site if there is a germline variant within this margin
+        window = 1 # previously 10
 
         start, end = ref_pos + margin, ref_pos-window
         if end<0: end = 0 # sanity check
@@ -103,11 +143,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
         # filter site if there exists a germline variant with AF > 0.1 AND it overlaps with the somatic site of interest
         for site in check_sites:
-            try:
-                snp=get_snv(chrom, site, bamfile_n, ref_file)
-            except ValueError:
-                # end of chromosome, skip site
-                continue
+            snp=get_snv(get_coverage(bamfile_n, chrom, site), get_ref_base(site, chrom, ref_file))
             indel=get_indels(chrom, site, bamfile_n, ref_file)
 
             snp_AF, indel_AF = snp[-1], indel[-1]
@@ -121,7 +157,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
                     return True # site is close or equal to ref_pos
 
                 # if it is an indel on the left of ref_pos, check if it overlaps the somatic site (ref_pos)
-                elif site<ref_pos and indel_AF>snp_AF:
+                elif site<ref_pos and indel_AF>=snp_AF:
                     indel_length = abs(len(indel[0])-len(indel[1])) # length of insertion or deletion. diff between ref and alt sequence lengths
                     right_end = site + indel_length # right end of indel
 
@@ -135,120 +171,36 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
         return False
 
-    # finds most frequent element in a list
-    def most_frequent(List):
-        return max(set(List), key = List.count)
-
-    def get_indels(chrom, ref_pos, bamfile, ref_file):
-        DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT = 0, 0, 0
-
-        reads = bamfile.fetch(chrom, ref_pos, ref_pos+1)
-        indels = []
-
-        for read in reads: # extract the insertion/deletion in read at ref_pos
-            DEPTH += 1
-
-            insertion, deletion_length = '', 0
-
-            # this looks for an indel anywhere in the read. there may not be an indel at the position of interest
-            # for indels, the ref pos is the position before the start of indel
-            if read.cigarstring is None or not ('I' in read.cigarstring or 'D' in read.cigarstring):
-                REFERENCE_ALLELE_COUNT += 1
-                continue
-
-            aligned_pairs = read.get_aligned_pairs() # [ (0, ref_pos), (1, ref_pos+1) .. (4, None), (None, ref_pos + 5) .. ]
-
-            past_ref_pos = False
-
-            for p in aligned_pairs:
-                if p[1] == ref_pos: # position right before insertion or deletion
-                    past_ref_pos = True
-                    continue
-
-                if past_ref_pos:
-                    # read pos is None, i.e. deletion
-                    if p[0] is None:
-                        deletion_length += 1
-
-                    # ref pos is none, insertion
-                    elif p[1] is None:
-                        inserted_base = read.query_sequence[p[0]]
-                        insertion += inserted_base
-
-                    else:
-                        # if there is no indel right after ref pos, no evidence for indel in this read
-                        # so increment ref allele
-                        if p[1] == ref_pos+1:
-                            REFERENCE_ALLELE_COUNT += 1
-
-                        # stop parsing this read
-                        break
-
-            if len(insertion) > 0:
-                indels.append(insertion)
-
-            if deletion_length > 0:
-                indels.append(deletion_length)
-
-        reference_allele, alt_allele = '.', '.'
-        ALT_ALLELE_FRACTION = 0
-
-        if len(indels) == 0:
-            # no indels found in position, weird
-            return (reference_allele, alt_allele, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
-
-        most_frequent_indel = most_frequent(indels) # return the most frequent element (insertion 'str' or deletion 'int')
-        ALT_ALLELE_READ_COUNT = indels.count(most_frequent_indel)
-
-        if type(most_frequent_indel) is int:
-            # deletion length
-            reference_allele = ref_file.fetch(chrom, ref_pos, ref_pos + most_frequent_indel + 1).upper() # pos, del1, del2, del3
-            alt_allele = reference_allele[0] # if reference is 'ATCG', 'A' is the alt allele since this is deletion
-
-        elif type(most_frequent_indel) is str:
-            # insertion
-            reference_allele = ref_file.fetch(chrom, ref_pos, ref_pos + 1).upper() # e.g. 'A'
-            alt_allele = reference_allele + most_frequent_indel # e.g. 'A' + 'TCT', where 'TCT' is insertion
-
-        if DEPTH > 0:
-            ALT_ALLELE_FRACTION = round(float(ALT_ALLELE_READ_COUNT)/DEPTH, 4)
-
-        return (reference_allele, alt_allele, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
-
-
     def parse_indel_predictions(f):
         with open(f) as r:
             for line in r:
                 line = line.strip()
                 s=line.split('\t')
-                chrom, pos, pred_true = s[0], int(s[1]), round(float(s[2]), 4)
+                CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true = \
+                s[0], int(s[1]), s[2], s[3], int(s[4]), int(s[5]), int(s[6]), float(s[7]), float(s[8])
 
                 if pred_true < CUT_OFF:
                     continue
 
+                # if not args.ffpe and not args.normal_bam:
+                #     # tumor-only not ffpe
+                #     pred_true = adjust_pred_true(pred_true, ALT_ALLELE_FRACTION_IN_TUMOR)
+
                 FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
 
-                REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR = get_indels(chrom, pos, bamfile_t, ref_file)
-                #REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR = '.','.',0,0,0
-
-                # filter indels with AF<0.03, since AF filtering is not done in indel pre-filtering (indels/filter.py)
-                # snv already has AF filter (3.5%) in snvs/filter.py
-                if ALT_ALLELE_FRACTION_IN_TUMOR < 0.03:
-                    continue
-
-                if c.GERMLINE_FILTER and germline_filter(chrom, pos, bamfile_n, ref_file):
+                if c.GERMLINE_FILTER and bamfile_n and germline_filter(CHROM, POS, bamfile_n, ref_file):
                     continue # overlapping germline variant identified
 
-                POSITION_1_INDEXED = pos + 1
+                POSITION_1_INDEXED = POS + 1
 
                 INFO = 'TYPE=INDEL;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % \
-                (str(pred_true), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
+                (str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
 
                 FORMAT = 'GT:DP:RO:AO:AF'
 
                 SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
 
-                OUT = (chrom, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
+                OUT = (CHROM, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
 
                 out_string = ''
                 for i in OUT:
@@ -257,45 +209,40 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
                 vcf_write.write(out_string)
 
-    def get_snv(chrom, ref_pos, bamfile, ref_file):
-        coverage = bamfile.count_coverage(chrom, ref_pos, ref_pos+1)#, quality_threshold=c.MIN_BASE_QUALITY, read_callback=check_read)
+    def adjust_score(pred_true, training_prior_somatic_class):
+        # training_prior_somatic_class is the prior class probability of somatic mutation in training set
+        # pred_true is the model's predicted score for somatic mutation
+        adjusted_somatic_score = pred_true * 0.5/training_prior_somatic_class
+        adjusted_non_somatic_score = (1-pred_true) * (1-0.5)/(1-training_prior_somatic_class)
+        normalized_somatic_score = adjusted_somatic_score/(adjusted_somatic_score+adjusted_non_somatic_score)
+        return normalized_somatic_score
 
-        # [ (#A, #C, #G, #T) ] at each position in tumor
-        coverage_list = [(coverage[0][i], coverage[1][i], coverage[2][i], coverage[3][i])
-            for i in range(len(coverage[0]))]
+    def adjust_pred_true(pred_true, VAF):
+        training_prior_somatic_class = 0.5
+        if False:
+            pass
+        # elif VAF <= 0.1:
+        #     training_prior_somatic_class = 0.1
+        # elif VAF > 0.1 and VAF <= 0.2:
+        #     training_prior_somatic_class = 0.43
+        # elif VAF > 0.2 and VAF <= 0.3:
+        #     training_prior_somatic_class = 0.66
+        # elif VAF > 0.3 and VAF <= 0.4:
+        #     training_prior_somatic_class = 0.74
+        # elif VAF > 0.4 and VAF <= 0.5:
+        #     training_prior_somatic_class = 0.61
+        # elif VAF > 0.5 and VAF <= 0.6:
+        #     training_prior_somatic_class = 0.46
+        # elif VAF > 0.6 and VAF <= 0.7:
+        #     training_prior_somatic_class = 0.48
+        # elif VAF > 0.7 and VAF <= 0.8:
+        #     training_prior_somatic_class = 0.57
+        # elif VAF > 0.8 and VAF <= 0.9:
+        #     training_prior_somatic_class = 0.56
+        elif VAF > 0.9:
+            training_prior_somatic_class = 0.04
 
-        assert len(coverage_list) == 1
-        coverage_list = coverage_list[0] # A C G T
-        coverage_list = list(coverage_list) # convert tuple to list
-
-        REFERENCE_ALLELE = get_ref_base(ref_pos, chrom, ref_file)
-
-        try:
-            REFERENCE_ALLELE_COUNT = coverage_list[ALLELE_INDICES[REFERENCE_ALLELE]]
-        except KeyError:
-            # if the reference allele is ambiguous, 'N'
-            REFERENCE_ALLELE_COUNT = 0
-
-        DEPTH = sum(coverage_list)
-
-        if REFERENCE_ALLELE in ALLELE_INDICES: # can be 'N'
-            # find max count allele in tumor that is not reference allele, maybe an issue if there are two max count alleles
-            coverage_list_exclude_ref = coverage_list.copy()
-            coverage_list_exclude_ref.pop(ALLELE_INDICES[REFERENCE_ALLELE]) # remove ref allele
-            
-            ALT_ALLELE = ALLELES[coverage_list.index(max(coverage_list_exclude_ref))] # get index in original coverage_list of the max alt allele
-            ALT_ALLELE_READ_COUNT = max(coverage_list_exclude_ref)
-
-            if DEPTH > 0:
-                ALT_ALLELE_FRACTION = round(float(ALT_ALLELE_READ_COUNT)/float(DEPTH), 4)
-            else:
-                ALT_ALLELE_FRACTION = 0
-        else:
-            # ref allele is 'N' or something not ACGT, can't figure out ALT allele
-            ALT_ALLELE = 'N'
-            ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION = 0,0
-
-        return (REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
+        return adjust_score(pred_true, training_prior_somatic_class)
 
 
     def parse_snv_predictions(f):
@@ -303,24 +250,28 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
             for line in r:
                 line = line.strip()
                 s=line.split('\t')
-                chrom, pos, pred_true = s[0], int(s[1]), round(float(s[2]), 4)
+
+                CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true \
+                = s[0], int(s[1]), s[2], s[3], int(s[4]), int(s[5]), int(s[6]), float(s[7]), float(s[8])
 
                 if pred_true < CUT_OFF:
                     continue
 
-                REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR = get_snv(chrom, pos, bamfile_t, ref_file)
+                # if not args.ffpe and not args.normal_bam:
+                #     # tumor-only not ffpe
+                #     # adjust the SCORE based on VAF
+                #     pred_true = adjust_pred_true(pred_true, ALT_ALLELE_FRACTION_IN_TUMOR)
 
-                if c.GERMLINE_FILTER and germline_filter(chrom, pos, bamfile_n, ref_file):
+                if c.GERMLINE_FILTER and bamfile_n and germline_filter(CHROM, POS, bamfile_n, ref_file):
                     continue # overlapping germline variant identified
 
-                POSITION_1_INDEXED = pos + 1
+                POSITION_1_INDEXED = POS + 1
                 FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
-                INFO = 'TYPE=SNV;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % \
-                (str(pred_true), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
+                INFO = 'TYPE=SNV;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % (str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
                 FORMAT = 'GT:DP:RO:AO:AF'
                 SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
 
-                OUT = (chrom, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
+                OUT = (CHROM, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
 
                 out_string = ''
                 for i in OUT:
@@ -337,22 +288,10 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
 
     vcf_write.close()
 
-    os.rename(output_vcf, output_vcf.replace('.vcf.temp', '.vcf'))
-    output_vcf = output_vcf.replace('.vcf.temp', '.vcf')
+    os.rename(output_vcf, output_vcf.replace('.temp.vcf.gz', '.vcf.gz'))
+    output_vcf = output_vcf.replace('.temp.vcf.gz', '.vcf.gz')
 
     print(("Output VCF:", output_vcf))
-
-    # 1 index pos
-    # make pred_true 4 decimal places
-    # fetch ref sequence and alt sequence
-    # Sort positions by chromosome number
-    # cut off predictions < .10
-
-    # ID is ., QUAL is .
-    # FILTER is PASS, REJECT, LowQual
-    # INFO IS: SCORE=0.4583;DP=96;RO=93;AO=3;AF=0.0312;
-    # FORMAT IS: GT:DP:RO:AO:AF
-    # SAMPLE IS: 0/1:96:93:3:0.0312
 
 def check_batches_complete(predictions_folder, candidates_path):
     # checks if the predictions folder has preds for all candidates
@@ -374,6 +313,93 @@ def check_batches_complete(predictions_folder, candidates_path):
     else:
         return True
 
+def parse_vcf(vcf_file, filename, snv=True, PASS_only=True):
+    count = 0
+
+    if vcf_file.endswith('.gz'):
+        import gzip
+        vcf = gzip.open(vcf_file, 'rt')
+    else:
+        vcf = open(vcf_file)
+
+    is_varnet_vcf, is_mutect2_vcf, strelka = False, False, False # flag to check if parsing varnet's vcf
+    
+    with open(filename, 'a') as f:
+        for line in vcf:
+            if line.startswith('#'):
+                # header
+                
+                if line.startswith('##source=VarNet'):
+                    is_varnet_vcf = True
+                    # is_varnet_vcf = False # use only PASS calls for varnet too
+                    print('>>> Parsing VarNet VCF:', vcf_file)
+
+                elif line.startswith('##source=Mutect2'):
+                    is_mutect2_vcf = True
+                    print('>>> Parsing Mutect2 VCF:', vcf_file)
+
+                elif line.startswith('##source=strelka'):
+                    is_strelka_vcf = True
+                    print('>>> Parsing Strelka VCF:', vcf_file)
+
+                continue
+                
+            CHROM, POS, REF, ALT, FILTER = line.split()[0], line.split()[1], line.split()[3], line.split()[4], line.split()[6]
+
+            if is_varnet_vcf:
+                # separate rule for varnet vcf
+                SCORE = float(line.split('SCORE=')[1].split(';')[0])
+                if SCORE > 0.50: # 0.95, 0.9, 0.7 and 0.8 about the same for snv
+                    USE_CALL = True
+                else:
+                    USE_CALL = False
+
+            elif is_mutect2_vcf:
+                import re
+                columns = line.strip().split('\t')
+                info_column = columns[7]
+                tlod_match = re.search(r'TLOD=([\d\.]+)', info_column)
+
+                if tlod_match:
+                    TLOD = float(tlod_match.group(1))
+                    USE_CALL = FILTER == 'PASS' and TLOD > 20 # 23 # 19 # 15 # 10 # 7 mutect2's default --tumor-lod is 3.0 (calls below this are not included in vcf)
+                else:
+                    USE_CALL = FILTER == 'PASS' # use all PASS calls
+
+                # USE_CALL = FILTER == 'PASS' # use all PASS calls
+                
+            elif is_strelka_vcf:
+                import re
+                columns = line.strip().split('\t')
+                info_column = columns[7]
+                somaticevs_match = re.search(r'SomaticEVS=([\d\.]+)', info_column)
+                
+                if somaticevs_match:
+                    SomaticEVS = float(somaticevs_match.group(1))
+                    USE_CALL = FILTER == 'PASS' and SomaticEVS > 10 # 12 # 14 # 10 # strelka2's default EVS cutoff appears to be around 6 although it varies with version: https://github.com/Illumina/strelka/issues/79
+                else:
+                    USE_CALL = FILTER == 'PASS' # use all PASS calls
+            else:
+                # other callers
+                USE_CALL = FILTER == 'PASS'
+                # USE_CALL = FILTER == 'PASS' or (not PASS_only)
+                
+            if USE_CALL:
+                if (len(REF) == 1 and (len(ALT) == 1 or (len(ALT) == 3 and ALT[1] == ','))): # REF and ALT should be one base each (ALT can have two possible bases separated by comma e.g. 'A,G')
+                    # SNV
+                    if snv:
+                        f.write('%s\t%d\n' % (CHROM, int(POS)-1)) # convert to 0-indexed
+                        count+=1
+                else:
+                    #INDEL
+                    if not snv:
+                        f.write('%s\t%d\n' % (CHROM, int(POS)-1)) # convert to 0-indexed
+                        count+=1
+
+    vcf.close()
+
+    print('Extracted', count, 'SNVs' if snv else 'indels', 'from', vcf_file)
+
 def main():
     sample_folder = os.path.join(args.output_dir, args.sample_name)
     create_folder(sample_folder)
@@ -384,6 +410,32 @@ def main():
         print(("VCF:", output_vcf))
         return
 
+    if args.ffpe:
+        # extract candidates from args.vcf
+        candidates_folder = os.path.join(sample_folder, c.sample_candidates_folder)
+
+        create_folder(candidates_folder)
+        print(("Candidates Directory: %s\n" % candidates_folder))
+
+        snv_candidates_folder = os.path.join(candidates_folder, c.snv_candidates_folder)
+        indel_candidates_folder = os.path.join(candidates_folder, c.indel_candidates_folder)
+        create_folder(snv_candidates_folder)
+        create_folder(indel_candidates_folder)
+        
+        if not args.indel: # do snv
+            snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
+            if not os.path.exists(snv_candidates_file):
+                parse_vcf(args.vcf, snv_candidates_file, snv=True)
+            else:
+                print('>>> SNV candidates files exists.')
+
+        if not args.snv: # do indel
+            indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+            if not os.path.exists(indel_candidates_file):
+                parse_vcf(args.vcf, indel_candidates_file, snv=False)
+            else:
+                print('>>> INDEL candidates files exists.')
+        
     # split into 100 batches
     split_num = 100
 
@@ -409,7 +461,7 @@ def main():
                 print("SNV Candidate positions missing. Please run the filter script before prediction.")
                 return
 
-            snv_candidates = pd.read_csv(snv_candidates_path, sep='\t', header=None, names=['chrom', 'pos'], dtype={'chrom': str, 'pos': int})
+            snv_candidates = pd.read_csv(snv_candidates_path, sep='\t', header=None, names=['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF'], dtype={'chrom': str, 'pos': int, 'REF': str, 'ALT': str, 'DP': int, 'RO': int, 'AO': int, 'AF': float})
 
             # Sort the labels file by position and chromosome and then reindex
             snv_candidates = snv_candidates.sort_values(['pos'], ascending=[True]).reset_index(drop=True)
@@ -444,7 +496,7 @@ def main():
                 print("Candidate positions missing. Please run the filter script before predict.")
                 return
 
-            indel_candidates = pd.read_csv(indel_candidates_path, sep='\t', header=None, names=['chrom', 'pos'], dtype={'chrom': str, 'pos': int})
+            indel_candidates = pd.read_csv(indel_candidates_path, sep='\t', header=None, names=['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF'], dtype={'chrom': str, 'pos': int, 'REF': str, 'ALT': str, 'DP': int, 'RO': int, 'AO': int, 'AF': float})
 
             # Sort the labels file by position and chromosome and then reindex
             indel_candidates = indel_candidates.sort_values(['pos'], ascending=[True]).reset_index(drop=True)
@@ -462,9 +514,81 @@ def main():
 
             concatenate_batch_prediction_results(indel_predictions_folder)
 
-    """ MAKE VCF FILE """
-    make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
+    if args.ffpe:
+        # filter args.vcf
+        filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
+    else:
+        """ MAKE VCF FILE """
+        make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
 
+def filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
+    output_vcf_filename = os.path.join(sample_folder, args.sample_name + '.vcf')
+    
+    if os.path.exists(output_vcf_filename):
+        print(f'>>> Filtered VCF file exists. Delete it to re-generate: {output_vcf_filename}')
+        return
+        
+    output_vcf = open(output_vcf_filename, 'w')
+
+    varnet_ffpe_calls = {}
+    filtered_artifact_count = 0
+
+    def parse_preds(predictions_file, varnet_ffpe_calls):        
+        with open(predictions_file) as r:
+            for line in r:
+                line = line.strip()
+                s=line.split('\t')
+                chrom, pos, pred_true = s[0], int(s[1]), round(float(s[2]), 4)
+
+                key = f'chrom{chrom}pos{pos+1}' # convert pos to 1-indexed
+                varnet_ffpe_calls[key] = pred_true
+    
+    parse_preds(snv_predictions_file, varnet_ffpe_calls)
+    parse_preds(indel_predictions_file, varnet_ffpe_calls)
+        
+    if args.vcf.endswith('.gz'):
+        import gzip
+        vcf = gzip.open(args.vcf, 'rt')
+    else:
+        vcf = open(args.vcf)
+
+    is_varnet_vcf, is_mutect2_vcf, strelka = False, False, False
+    ARTIFACT_CUT_OFF = 0.5 # DEFAULT for other callers
+
+    for line in vcf:
+        if line.startswith('#'):
+            # write header
+            output_vcf.write(line)
+
+            if line.startswith('##source=VarNet'):
+                is_varnet_vcf = True
+                ARTIFACT_CUT_OFF = 0.7 # 0.7
+            elif line.startswith('##source=Mutect2'):
+                is_mutect2_vcf = True
+                ARTIFACT_CUT_OFF = 0.05
+            elif line.startswith('##source=strelka'):
+                is_strelka_vcf = True
+                ARTIFACT_CUT_OFF = 0.85
+
+            continue
+
+        CHROM, POS, REF, ALT, FILTER = line.split()[0], line.split()[1], line.split()[3], line.split()[4], line.split()[6]
+
+        if FILTER != 'PASS' and not is_varnet_vcf:
+            continue # skip non-PASS calls from other callers
+        else:
+            # PASS call or varnet_vcf (output all calls for varnet)
+            key = f'chrom{CHROM}pos{POS}'
+            if key in varnet_ffpe_calls and varnet_ffpe_calls[key] < ARTIFACT_CUT_OFF:
+                # skip artifact
+                filtered_artifact_count += 1
+                continue
+            else:
+                output_vcf.write(line)
+
+    print('>>> Filtered artifacts:', filtered_artifact_count)
+    print(f'>>> Saved filtered VCF: {output_vcf_filename}')
+    
 def parse_args():
     parser = argparse.ArgumentParser(description="Model Predictions")
     parser.add_argument('--path_to_positions_to_predict')
@@ -474,12 +598,10 @@ def parse_args():
     parser.add_argument('--experiment_id', default=None)
     parser.add_argument('--include_allele_frequency', required=False)
 
-    parser.add_argument('--deep_sequencing', default=False)
-
     parser.add_argument('--sample_name', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--reference', required=True)
-    parser.add_argument('--normal_bam', required=True)
+    parser.add_argument('--normal_bam', required=False, default=None)
     parser.add_argument('--tumor_bam', required=True)
     parser.add_argument('--processes', default=1, type=int)
 
@@ -487,11 +609,19 @@ def parse_args():
     parser.add_argument('-indel', action='store_true') # read as indel_only
 
     parser.add_argument('--update_batch_norm', default=False) # update batch norm stats for test sample
+    parser.add_argument('--ffpe', action='store_true') # for FFPE samples, must provide VCF
+    parser.add_argument('--vcf', default=False, type=str, help='VCF file for FFPE prediction') # for FFPE samples, must provide VCF
+
+    parser.add_argument('--threshold', default=None, type=float)
 
     return parser.parse_args()
 
+            
 if __name__ == '__main__':
     args = parse_args()
+
+    if args.ffpe and not args.vcf:
+        parser.error("--vcf is required if --ffpe is provided.")
 
     if args.experiment_id:
         c.set_experiment_paths(int(args.experiment_id))

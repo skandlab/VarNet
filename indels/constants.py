@@ -227,8 +227,7 @@ elif user == User.KIRAN_AQUILA:
     experiments_folder = '/mnt/projects/krishnak/kiran/smudl_trained_models/indels/'
 
 ######### PREDICTION PARAMS #########
-SAMPLE_READS = True # sample reads and sort by CO
-VARIABLE_INPUT_SIZE = False
+
 
 ###### TRAINING PARAMS #########
 SPECTRAL_DECOUPLING = False # default l2 reg with weight 2e-05
@@ -240,7 +239,8 @@ LR_SCHEDULE = True # False
 LOSS = 'binary_crossentropy' # 'mean_squared_error' # 
 
 SAMPLE_READS = True # sample reads and sort by CO. don't use this when generating training data if you don't want sampling, or set SAMPLE_READS_COUNT to 1.
-SAMPLE_READS_COUNT = 1 # default 1. for use with SAMPLE_READS
+# SAMPLE_READS_COUNT = 1 # default 1. for use with SAMPLE_READS
+MULTIPLE_READ_SAMPLES = False # if True, create_input_tensor_for_position() will sample multiple sets of reads at each site. If False, samples once.
 
 VARIABLE_INPUT_SIZE = False
 SAVE_LATEST_CHECKPOINT = False
@@ -248,9 +248,11 @@ SAVE_LATEST_CHECKPOINT = False
 INPUT_WHITENING = False # decorrelate input pixels per channel
 WHITENING_MATRIX = 'training_data_whitening_matrix.npy' # computed using 10k random training samples. see smudl/utils.py -> compute_whitening_matrix_torch
 
+TUMOR_ONLY_TRAINING = False # to train model with tumor-only encoding
+
 mixup_alpha = 0.5 # --mixup command line arg must be passed to train.py. alpha < 1 is not much mixing, concentrated close to 0 and 1 (alpha=0 is no mixing); alpha=1 is uniform in [0,1]; alpha -> infinity is concentrated at 0.5 (equal mixing)
 
-architecture = 'convnet2_retrain_subset' # 'inceptionv3_retrain_subset'#'inceptionv3_input_whitening'# 'mixup_%s' % mixup_alpha # 'inceptionv3_train_on_val.ood_val_set'# 'inceptionv3_train_on_val' # 'inceptionv3_mean_squared_error' # 'EMA.inceptionv3_spectral_decoupling_sd_coeff_%s' % SD_COEFF # 'inceptionv3' # 'inceptionv3_fgsm_rand_eps_0.25' #'convnet2_unaugmented_batch_size_32_sample_weights' # 'inceptionv3_unaugmented_sample_weight_crc_0_1_batch_size_32' # 'inceptionv3_unaugmented_batch_size_256' #'inceptionv3_unaugmented_sample_weight_crc_0.5_batch_size_32' # 'inceptionv3_data_augmented_batch_size_256' # 'convnet2_dropout_memory' # 'EfficientNetB0'
+architecture = 'inceptionv3_tumor_only' # 'convnet2_retrain_subset' # 'inceptionv3_retrain_subset'#'inceptionv3_input_whitening'# 'mixup_%s' % mixup_alpha # 'inceptionv3_train_on_val.ood_val_set'# 'inceptionv3_train_on_val' # 'inceptionv3_mean_squared_error' # 'EMA.inceptionv3_spectral_decoupling_sd_coeff_%s' % SD_COEFF # 'inceptionv3' # 'inceptionv3_fgsm_rand_eps_0.25' #'convnet2_unaugmented_batch_size_32_sample_weights' # 'inceptionv3_unaugmented_sample_weight_crc_0_1_batch_size_32' # 'inceptionv3_unaugmented_batch_size_256' #'inceptionv3_unaugmented_sample_weight_crc_0.5_batch_size_32' # 'inceptionv3_data_augmented_batch_size_256' # 'convnet2_dropout_memory' # 'EfficientNetB0'
 
 all_data_folder_name = 'all_data'
 normalized_training_data_folder_name = 'normalized_training_data'
@@ -278,7 +280,6 @@ channels_std_devs_file = 'channel_standard_deviations_for_normalization.npy'
 shuffled_training_data_folder = 'shuffled_training_data'
 shuffled_data_indices = 'shuffled_data_indices.npy'
 combined_predictions_file = 'Predictions.csv'
-
 config_file = 'config_%s.npy' % architecture # save constants file as dictionary
 
 BALANCE_CANCER_TYPES_IN_TRAINING = False
@@ -295,9 +296,21 @@ EXPONENTIAL_MOVING_AVERAGE = False # keep an ema copy of the model
 EMA_WEIGHTS_MODEL = 'model.EMA.%s.hdf5' % architecture
 
 """ INDEL MODEL """
+# normal-tumor models
 indel_model_folder = 'indel_model'
 BEST_MODEL_ARCHITECTURE_PATH = os.path.join(indel_model_folder, 'model.best.architecture.json')
 BEST_MODEL_WEIGHTS_PATH = os.path.join(indel_model_folder, 'model.best.weights.hdf5')
+
+# tumor-only transformer
+BEST_TUMOR_ONLY_MODEL_PATH = 'model.TUMOR_ONLY_TRANSFORMER'
+
+# tumor-only FFPE transformer
+BEST_FFPE_TUMOR_ONLY_MODEL_PATH = 'model.FFPE_TUMOR_ONLY_TRANSFORMER'
+
+# tumor-only models, varnet 1.1.0 train set inceptionv3
+TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(indel_model_folder, 'model.best.architecture.tumor_only.json')
+TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(indel_model_folder, 'model.best.weights.tumor_only.hdf5')
+
 NORMALIZATION_MEANS_PATH = os.path.join(indel_model_folder, channels_means_file)
 NORMALIZATION_STD_DEVS_PATH = os.path.join(indel_model_folder, channels_std_devs_file)
 
@@ -327,7 +340,7 @@ def set_experiment_paths(experiment_id):
     global CURRENT_NORMALIZATION_STD_DEVS_PATH
     CURRENT_NORMALIZATION_STD_DEVS_PATH = os.path.join(CURRENT_EXPERIMENT_FOLDER, channels_std_devs_file)
 
-DEFAULT_EXPERIMENT_ID = 2#1
+DEFAULT_EXPERIMENT_ID = 1 # 2
 
 
 TUMOR_NORMAL_ADJACENT = True
@@ -335,12 +348,16 @@ SEQ_LENGTH = 75 # length of sequence. must be odd
 FLANK = int((SEQ_LENGTH-1)/2)
 NUM_READS = 140
 NUM_CHANNELS_PER_IMAGE = 4
+PER_IMAGE_WIDTH = SEQ_LENGTH
 
 MAX_READS = 500 # max reads to use if all reads are used during prediction (when VARIABLE_INPUT_SIZE=True)
 
 if TUMOR_NORMAL_ADJACENT:
     NUM_CHANNELS = NUM_CHANNELS_PER_IMAGE + 1
-    INPUT_SHAPE = [ NUM_READS, 2*(SEQ_LENGTH), NUM_CHANNELS]
+
+    INPUT_SHAPE = [ NUM_READS, 2*SEQ_LENGTH, NUM_CHANNELS] # normal+tumor input
+    TUMOR_ONLY_INPUT_SHAPE = [ NUM_READS, SEQ_LENGTH, NUM_CHANNELS] # tumor-only
+
 else:
     NUM_CHANNELS = 2 * NUM_CHANNELS_PER_IMAGE + 1
     INPUT_SHAPE = [NUM_READS, SEQ_LENGTH, NUM_CHANNELS]

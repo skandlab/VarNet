@@ -270,7 +270,7 @@ def generate_image(reads, config, insertions, start_at_read, img):
         if stack_read_in_image(reads[i], img, image_row, config, insertions):
             image_row += 1
 
-            if image_row >= c.NUM_READS and not c.VARIABLE_INPUT_SIZE:
+            if image_row == c.NUM_READS and not c.VARIABLE_INPUT_SIZE:
                 break
 
     return image_row
@@ -351,15 +351,20 @@ def create_input_tensor_for_position(chrX, position, bamfile_n, bamfile_t, ref_f
     start_pos = get_start(position)
     end_pos = get_end(position)
 
-    normal_reads = get_reads(bamfile_n, chrX, start_pos, end_pos)
+    if bamfile_n:
+        normal_reads = get_reads(bamfile_n, chrX, start_pos, end_pos)
+    else:
+        # tumor only mode
+        normal_reads = []
+
     tumor_reads = get_reads(bamfile_t, chrX, start_pos, end_pos)
 
     # how many times to sample c.NUM_READS reads from bams
     n_read_samples = 1
 
     # sample reads n times if c.SAMPLE_READS AND if there are more than c.NUM_READS reads in either normal or tumor
-    if c.SAMPLE_READS and (len(normal_reads) > c.NUM_READS or len(tumor_reads) > c.NUM_READS):
-        n_read_samples = c.SAMPLE_READS_COUNT
+    if c.SAMPLE_READS and c.MULTIPLE_READ_SAMPLES and (len(normal_reads) > c.NUM_READS or len(tumor_reads) > c.NUM_READS):
+        n_read_samples = round(max(len(normal_reads), len(tumor_reads)) / c.NUM_READS)
 
     if c.VARIABLE_INPUT_SIZE:
         if len(normal_reads) > c.MAX_READS: # cap on reads even if variable_input_size
@@ -395,10 +400,15 @@ def create_input_tensor_for_position(chrX, position, bamfile_n, bamfile_t, ref_f
         update_config(config, len(normal_reads), len(tumor_reads), insertions)
 
         try:
-            # Create a view of the image to reduce amount of copying
-            normal_img = X[sample-1, :, :c.SEQ_LENGTH, :c.NUM_CHANNELS_PER_IMAGE]
-            num_rows_n = generate_image(normal_reads, config, insertions,
-                                        config['n_start'], normal_img)
+            if bamfile_n:
+                # Create a view of the image to reduce amount of copying
+                normal_img = X[sample-1, :, :c.SEQ_LENGTH, :c.NUM_CHANNELS_PER_IMAGE]
+                num_rows_n = generate_image(normal_reads, config, insertions,
+                                            config['n_start'], normal_img)
+            else:
+                # tumor-only mode
+                num_rows_n = 0
+
         except ValueError:
             print((
                 "Skipping %s %s. location not in normal bam"
@@ -435,6 +445,10 @@ def create_input_tensor_for_position(chrX, position, bamfile_n, bamfile_t, ref_f
                 % (chrX, str(position))
             ))
             raise
+
+    if not bamfile_n:
+        # tumor-only mode, remove normal
+        X = X[:, :, c.PER_IMAGE_WIDTH:, :]
 
     return X
 
@@ -549,9 +563,18 @@ def generate_images_for_positions(sample_name, positions_to_generate,
         try:
             X = create_input_tensor_for_position(
                                     chrX, position, bamfile_n, bamfile_t, ref_file)
-            X_arr.append(X[0, :, :, :])
+
+            if X.shape[0] > 1:
+                # multiple read samples at site
+                for _ in range(X.shape[0]):
+                    X_arr.append(X[_])
+                    Y.append(y) # same label for all read samples
+            else:
+                X_arr.append(X[0, :, :, :])
+                Y.append(y)
+    
             del X
-            Y.append(y)
+            
         except ValueError:
             print((
                 "Error appending training position at "
@@ -560,6 +583,7 @@ def generate_images_for_positions(sample_name, positions_to_generate,
             continue
 
     assert len(X_arr) == len(Y)
+    print(("output length: %d" % len(Y)))
 
     length = len(Y)
     X_arr = np.asarray(X_arr)

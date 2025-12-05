@@ -16,7 +16,7 @@ from joblib import Parallel, delayed
 # repo_base = dirname(dirname(abspath(__file__)))
 # sys.path.append(repo_base)
 
-from snvs.generate_training_data import is_usable_read
+from snvs.generate_training_data import is_usable_read, get_reads
 
 import indels.constants_filter as c
 
@@ -292,6 +292,69 @@ def record_indels_detail(bamfile, chrX, start_pos, end_pos):
 
     return recorded_indels, positions_dict
 
+def ffpe_filter_indels(bamname_n, bamname_t, indel_candidates_file):
+    bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
+    bamfile_t = pysam.AlignmentFile(bamname_t, "rb") 
+    
+    output_file = indel_candidates_file.replace('.csv','.npy')
+    if os.path.exists(output_file):
+        print('FFPE data file exists, deleting...', output_file)
+        os.remove(output_file)
+    data = {}
+
+    candidates = open(indel_candidates_file)
+    candidates_list = []
+
+    for line in candidates:
+        line = line.strip().split()
+        chrom, pos = line[0], int(line[1]) # pos is 0-indexed position of site before indel
+        candidates_list.append([chrom,pos])
+
+    from random import shuffle
+    shuffle(candidates_list)
+
+    #candidates_list = candidates_list[:500000] # limit 500k
+
+    for idx, site in enumerate(candidates_list):
+        chrom, pos = site[0], site[1]
+        reads = get_reads(bamfile_t, chrom, pos, pos+2) # get tumor reads overlapping pos as well as pos+1 to get indels 1-site ahead
+
+        indel_reads = [] 
+        for read in reads:
+            aligned_pairs = read.get_aligned_pairs()
+            num_aligned_pairs = len(aligned_pairs)
+            for i,p in enumerate(aligned_pairs):
+                if i == (num_aligned_pairs-1):
+                    break # stop 1 site before the end since we are checking for indels ahead of current pair
+
+                ref_pos = p[1]
+                read_pos = p[0]
+                if ref_pos == pos:
+                    # position right before indel
+                    if aligned_pairs[i+1][1] is None: # ref_pos is None, so insertion detected at the next site
+                        indel_reads.append(read)
+                    elif aligned_pairs[i+1][0] is None: # read_pos is None, deletion detected at the next site
+                        indel_reads.append(read) 
+                    break
+
+        read1_indel_reads, forward_indel_reads = 0,0
+        for read in indel_reads:
+            if read.is_read1:
+                read1_indel_reads += 1
+            if not read.is_reverse:
+                forward_indel_reads += 1
+        
+        pos_key = 'chrom%spos%d' % (chrom, pos) # pos is 0-indexed pos of site prior to indel
+        data[pos_key] = {'total_tumor_reads': len(reads), 'indel_reads_count': len(indel_reads), 'read1_indel_reads': read1_indel_reads, 'forward_indel_reads': forward_indel_reads}
+    
+        if idx % 1000 == 0:
+            # save every 1000 sites
+            np.save(output_file, data)
+            print('Saved:', output_file)
+
+    np.save(output_file, data)
+    print('Saved:', output_file)
+
 def record_indels_simple(bamfile, chrX, start_pos, end_pos):
     """
     Iterate through all reads between start_pos and end_pos in chrX of bamfile, and identify
@@ -308,7 +371,8 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
             a set of ints, corresponding to the ref pos of an indel
     """
     # load reads into RAM
-    reads = bamfile.fetch(chrX, start_pos, end_pos)
+#    reads = bamfile.fetch(chrX, start_pos, end_pos)
+    reads = get_reads(bamfile, chrX, start_pos, end_pos) # applies is_usable_read() filter
 
     # compile regexes before iterating to save time        
     segment_re = re.compile(r"\d+[IDMS]")
@@ -323,7 +387,7 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
         cig = read.cigarstring
 
         # handle case where read has no cigarstring
-        if cig is not None and ('I' in cig or 'D' in cig) and is_usable_read(read):
+        if cig is not None and ('I' in cig or 'D' in cig):
             # the curr_index is the index in this read of an indel. start at 0
             curr_index = 0
             qual_index = 0
@@ -361,13 +425,6 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
                     else:
                         POSITIONS_COVERAGE[position] += 1
                    
-                    # COLLECTING STATISTICS OF TRUE POSITIONS 
-                    if 'true_positions' in globals():
-                        assert len(list(true_positions.keys())) > 0
-                        key = 'chrom%spos%s' % (chrX, position) 
-                        if key in true_positions:
-                            TRUE_MQS.append(read.mapping_quality)                
- 
                     # make sure position is within searching range, and satisfies filtering requirements
                     if position >= start_pos and position < end_pos and sum(quals)/len(quals) >= c.MIN_AVG_BQ and read.mapping_quality >= c.MIN_MQ[0]:   
                         recorded_indels[position] = True
@@ -391,13 +448,6 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
                     else:   
                         POSITIONS_COVERAGE[position] += 1
  
-                    # COLLECTING STATISTICS OF TRUE POSITIONS 
-                    if 'true_positions' in globals():
-                        assert len(list(true_positions.keys())) > 0
-                        key = 'chrom%spos%s' % (chrX, position)
-                        if key in true_positions:
-                            TRUE_MQS.append(read.mapping_quality)
-
                     # make sure position is within searching range, and satisfies filtering requirements
                     if position >= start_pos and position < end_pos and read.mapping_quality >= c.MIN_MQ[1]:
                         recorded_indels[position] = False
@@ -422,11 +472,6 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
     # reject all positions with count < MIN_FREQ
     for position, count in list(positions_dict.items()):
 
-        if 'true_positions' in globals():
-            key = 'chrom%spos%s' % (chrX, position)
-            if key in true_positions:
-                TRUE_FREQS.append(max(count)) # FREQ, count = [insertion count, deletion count]
-
         if count[0] < c.MIN_FREQ[0] and count[1] < c.MIN_FREQ[1]:
             recorded_indels.pop(position)
             #del recorded_indels[recorded_indels.index(position)]
@@ -438,7 +483,90 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
 
     return recorded_indels
 
-def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, regions, batch_num):
+def get_indels(chrom, ref_pos, bamfile, ref_file):
+    """
+    ref_pos must be the 0-indexed pos of the site before start of indel. 
+    """
+    DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT = 0, 0, 0
+
+    reads = bamfile.fetch(chrom, ref_pos, ref_pos+1)
+    indels = []
+
+    # finds most frequent element in a list
+    def most_frequent(List):
+        return max(set(List), key = List.count)
+
+    for read in reads: # extract the insertion/deletion in read at ref_pos
+        DEPTH += 1
+
+        insertion, deletion_length = '', 0
+
+        # this looks for an indel anywhere in the read. there may not be an indel at the position of interest
+        # for indels, the ref pos is the position before the start of indel
+        if read.cigarstring is None or not ('I' in read.cigarstring or 'D' in read.cigarstring):
+            REFERENCE_ALLELE_COUNT += 1
+            continue
+
+        aligned_pairs = read.get_aligned_pairs() # [ (0, ref_pos), (1, ref_pos+1) .. (4, None), (None, ref_pos + 5) .. ]
+
+        past_ref_pos = False
+
+        for p in aligned_pairs:
+            if p[1] == ref_pos: # position right before insertion or deletion
+                past_ref_pos = True
+                continue
+
+            if past_ref_pos:
+                # read pos is None, i.e. deletion
+                if p[0] is None:
+                    deletion_length += 1
+
+                # ref pos is none, insertion
+                elif p[1] is None:
+                    inserted_base = read.query_sequence[p[0]]
+                    insertion += inserted_base
+
+                else:
+                    # if there is no indel right after ref pos, no evidence for indel in this read at ref_pos
+                    # so increment ref allele
+                    if p[1] == ref_pos+1:
+                        REFERENCE_ALLELE_COUNT += 1
+
+                    # stop parsing this read
+                    break
+
+        if len(insertion) > 0:
+            indels.append(insertion)
+
+        if deletion_length > 0:
+            indels.append(deletion_length)
+
+    REFERENCE_ALLELE, ALT_ALLELE = '.', '.'
+    ALT_ALLELE_FRACTION = 0
+
+    if len(indels) == 0:
+        # no indels found in position, weird
+        return (REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
+
+    most_frequent_indel = most_frequent(indels) # return the most frequent element (insertion 'str' or deletion 'int')
+    ALT_ALLELE_READ_COUNT = indels.count(most_frequent_indel)
+
+    if type(most_frequent_indel) is int:
+        # deletion length
+        REFERENCE_ALLELE = ref_file.fetch(chrom, ref_pos, ref_pos + most_frequent_indel + 1).upper() # pos, del1, del2, del3
+        ALT_ALLELE = REFERENCE_ALLELE[0] # if reference is 'ATCG', 'A' is the alt allele since this is deletion
+
+    elif type(most_frequent_indel) is str:
+        # insertion
+        REFERENCE_ALLELE = ref_file.fetch(chrom, ref_pos, ref_pos + 1).upper() # e.g. 'A'
+        ALT_ALLELE = REFERENCE_ALLELE + most_frequent_indel # e.g. 'A' + 'TCT', where 'TCT' is insertion
+
+    if DEPTH > 0:
+        ALT_ALLELE_FRACTION = round(float(ALT_ALLELE_READ_COUNT)/DEPTH, 4)
+
+    return (REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
+
+def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, ref_file, regions, batch_num):
 
     output_file = os.path.join(candidates_folder, 'batch_%s.csv' % str(batch_num) )
     
@@ -446,7 +574,12 @@ def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, regions, ba
         print(("INDEL BATCH COMPLETE: %s" % output_file))
         return
 
-    bamfile_n = pysam.AlignmentFile(bamfile_n_path, "rb")
+    if bamfile_n_path:
+        bamfile_n = pysam.AlignmentFile(bamfile_n_path, 'rb')
+    else:
+        # tumor-only mode
+        bamfile_n = None
+
     bamfile_t = pysam.AlignmentFile(bamfile_t_path, "rb")
 
     recorded_indels = []
@@ -454,49 +587,46 @@ def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, regions, ba
     for region in regions:
         chrom, start, end = region[0], region[1], region[2]
 
-        if c.ONLY_FILTER_TUMOR:
-            recorded_indels = record_indels_simple(bamfile_t, chrom, start, end)
+        # record_indels_simple returns dict
+        # positions returned by record_indels_simple are the 0-indexed position of the beginning of actual indel
+        # not one base before indel starts
 
-        else:
-            # record_indels_simple returns dict
-            # positions returned by record_indels_simple are the 0-indexed position of the beginning of actual indel
-            # not one base before indel starts
-
+        if bamfile_n:
             recorded_indels_n = record_indels_simple(bamfile_n, chrom, start, end)
-            recorded_indels_t = record_indels_simple(bamfile_t, chrom, start, end)
+        else:
+            # tumor-only mode
+            recorded_indels_n = {}
 
-            #recorded_indels_n = []
-            #for position in recorded_indels_t:
-            #    recorded_indels_n.extend(record_indels_simple(bamfile_n, chrom, position, position+1))
+        recorded_indels_t = record_indels_simple(bamfile_t, chrom, start, end)
 
-            # indels recorded in t should not be in n
-            for p in list(recorded_indels_t.keys()):
-                # accept if p not in normal or, 
+        # indels recorded in t should not be in n
+        for p in list(recorded_indels_t.keys()):
+            # accept if p not in normal or, 
 
-                # if p is in normal, the type of indel should be different. Insertions are assigned True, deletions are False
-                #if p not in recorded_indels_n or recorded_indels_t[p] != recorded_indels_n[p]:
+            # if p is in normal, the type of indel should be different. Insertions are assigned True, deletions are False
+            # f p not in recorded_indels_n or recorded_indels_t[p] != recorded_indels_n[p]:
 
-                # if p in normal, freqs and in tumor and normal should be different by some margin 
-                #if p in recorded_indels_n: margin = (recorded_indels_t[p] + recorded_indels_n[p])/15
-                margin = 3 # 4 reads
-                #margin = 0.02 # 2% AF difference
-                if p not in recorded_indels_n or abs(recorded_indels_t[p] - recorded_indels_n[p]) > margin:
-                    recorded_indels.append((chrom, p))            
+            # if p in normal, freqs and in tumor and normal should be different by some margin 
+            #if p in recorded_indels_n: margin = (recorded_indels_t[p] + recorded_indels_n[p])/15
+            margin = 3 # 4 reads
+            #margin = 0.02 # 2% AF difference
 
-            # indels recorded in n should not be in t
-            #for p in recorded_indels_n.keys():
-            #    if p not in recorded_indels_t:
-            #        recorded_indels.append(p)
-        
-    with open(output_file, 'a') as f:
+            if p not in recorded_indels_n or abs(recorded_indels_t[p] - recorded_indels_n[p]) > margin:
+                # get INFO for candidate site
+                REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT, TUMOR_ALT_ALLELE_READ_COUNT, TUMOR_ALT_ALLELE_FRACTION \
+                = get_indels(chrom, p-1, bamfile_t, ref_file) # get_indels() needs 0-indexed pos of site before indel
+
+                if TUMOR_ALT_ALLELE_FRACTION < c.MIN_INDEL_ALLELE_FREQUENCY:
+                    # apply AF filter here instead of VCF
+                    continue
+
+                recorded_indels.append((chrom, p, REFERENCE_ALLELE, ALT_ALLELE, str(TUMOR_DEPTH), str(REFERENCE_ALLELE_COUNT), str(TUMOR_ALT_ALLELE_READ_COUNT), str(TUMOR_ALT_ALLELE_FRACTION)))
+
+    with open(output_file, 'w') as f:
         for pos in recorded_indels:
-            f.write('%s\t%d\n' % (pos[0], int(pos[1])-1)) # 0-indexed position of the base before indel starts
+            f.write('%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' % (pos[0], pos[1]-1, pos[2], pos[3], pos[4], pos[5], pos[6], pos[7])) # 0-indexed position of the base before indel starts
 
     print(("COMPLETED INDEL BATCH", output_file))
-
-    if 'true_positions' in globals():
-        return [TRUE_FREQS, TRUE_MQS] 
-
 
 def divide_chromosomes_into_batches(superbatch, num_threads):
     """

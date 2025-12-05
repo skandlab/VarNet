@@ -1,15 +1,6 @@
-# from check_memory_consumption import memory_consumed
-
-# The main prediction pipeline script that loads the trained model and evaluates positions one-by-one on
-# CPUs in parallel, given positions file to evaluate on. Generates y-file and
-# computes resulting metrics
-
-# from memory_profiler import profile
-
 import os
 from time import time
 
-# === LIBRARIES === #
 import pysam
 import numpy as np
 import pandas as pd
@@ -26,54 +17,111 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import snvs.constants as c
 
-from snvs.generate_training_data import get_reference, generate_image, populate_array, create_input_tensor_for_position, get_ref_base
+from snvs.generate_training_data import get_reference, generate_image, populate_array, create_input_tensor_for_position, create_tumor_only_input_tensor_for_position, get_ref_base
 
 CURRENT_DIR = os.path.dirname(__file__) 
 
-def get_model():
+def get_model(args):
     from tensorflow.keras.models import model_from_json
-    with open(os.path.join(CURRENT_DIR, c.BEST_MODEL_ARCHITECTURE_PATH)) as f:
-        model_architecture = f.read()
-    
-    if c.TEST_TIME_TRAINING:
-        from tensorflow.keras.models import load_model
-        import tensorflow_addons as tfa
-        # for group normalization
-        #model = model_from_json(model_architecture, custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
-        model = load_model(os.path.join(CURRENT_DIR, c.BEST_MODEL_PATH), custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
-        assert model.optimizer is not None
+
+    if args.normal_bam and not args.ffpe:
+        # frozen tumor-normal convnet2 and not ffpe
+        BEST_MODEL_ARCHITECTURE_PATH = c.BEST_MODEL_ARCHITECTURE_PATH
+        BEST_MODEL_PATH = c.BEST_MODEL_PATH
+        BEST_MODEL_WEIGHTS_PATH = c.BEST_MODEL_WEIGHTS_PATH
+
+        if c.TEST_TIME_TRAINING:
+            from tensorflow.keras.models import load_model
+            # for group normalization
+            # import tensorflow_addons as tfa
+            #model = model_from_json(model_architecture, custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
+            model = load_model(os.path.join(CURRENT_DIR, BEST_MODEL_PATH), custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
+            assert model.optimizer is not None
+        else:
+            with open(os.path.join(CURRENT_DIR, BEST_MODEL_ARCHITECTURE_PATH)) as f:
+                model_architecture = f.read()
+            model = model_from_json(model_architecture)
+            model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
+
     else:
-        model = model_from_json(model_architecture)
-        model.load_weights(os.path.join(CURRENT_DIR, c.BEST_MODEL_WEIGHTS_PATH))
+        # frozen tumor-only or ffpe
+
+        # <start> tumor-only convnet2
+        if args.ffpe:
+            raise Exception('which model to load?')
+        else:
+            BEST_MODEL_ARCHITECTURE_PATH = c.TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH
+            BEST_MODEL_WEIGHTS_PATH = c.TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH
+
+            with open(os.path.join(CURRENT_DIR, BEST_MODEL_ARCHITECTURE_PATH)) as f:
+                model_architecture = f.read()
+            model = model_from_json(model_architecture)
+            model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
+        # </start> tumor-only convnet2
+
+        # <start> transformer 
+        # from tensorflow.keras.models import load_model
+        # if args.ffpe:
+        #     # load ffpe model transformer
+        #     BEST_MODEL_PATH = c.BEST_FFPE_TUMOR_ONLY_MODEL_PATH
+        # else:
+        #     # frozen tumor-only transformer
+        #     BEST_MODEL_PATH = c.BEST_TUMOR_ONLY_MODEL_PATH
+
+        # from pathlib import Path
+        # transformer_root = Path(__file__).parents[1] # ../
+        # path = os.path.join(transformer_root, BEST_MODEL_PATH)
+        # print('Loading checkpoint:', path)
+        # model = load_model(path)
+        # <start/> transformer 
 
     return model
 
-def predict_position(input_tensor, model, channel_means, channel_stds, training=False):
-    input_tensor -= channel_means
-    input_tensor /= channel_stds
+def predict_position(input_tensor, model, channel_means, channel_stds, training=False, args=None):
+    if channel_means is not None and channel_stds is not None:
+        # normalization not required for tumor-only/FFPE transformers
+        input_tensor -= channel_means
+        input_tensor /= channel_stds
 
     if not training:
         y_pred_test = model.predict(input_tensor)
-        return np.mean(y_pred_test) # return mean in case of c.SAMPLE_READS_COUNT > 1, batch prediction by sampling multiple batches of reads for the SAME position (NOT for a batch of different positions). no difference if c.SAMPLE_READS_COUNT=1
+        
+        if y_pred_test.shape[1] != 1:
+            # multi-class output, use somatic proba only
+            y_pred_test = y_pred_test[:,1]
+            
+        # return mean when c.SAMPLE_READS_COUNT > 1, i.e. multiple random samples of reads for the *same* position. Makes no difference if c.SAMPLE_READS_COUNT=1
+        return np.mean(y_pred_test)
     else:
         # to update batch norm statistics
         y_pred_test = model(input_tensor, training=True)
         return y_pred_test
 
-def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, deep_sequencing=False, update_batch_norm=False):
+def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, update_batch_norm=False):
     print(("SNV PREDICTION BATCH:", batch_num))
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-    bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False) # normal bamfile
+    if args.normal_bam:
+        bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False) # normal bamfile
+    else:
+        # tumor-only mode
+        bamfile_n = None
+    
     bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb", check_sq=False) # tumor bamfile
     ref_file = get_ref_file(args.reference)    
 
-    columns = ['chrom', 'pos', 'pred_true']
+    columns = ['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF', 'pred_true']
     results = pd.DataFrame(columns=columns)
     results['chrom'] = results['chrom'].astype(str)
     results['pos'] = results['pos'].astype(int)
+    results['REF'] = results['REF'].astype(str)
+    results['ALT'] = results['ALT'].astype(str)
+    results['DP'] = results['DP'].astype(int)
+    results['RO'] = results['RO'].astype(int)
+    results['AO'] = results['AO'].astype(int)
+    results['AF'] = results['AF'].astype(np.float64)
     results['pred_true'] = results['pred_true'].astype(np.float64)
 
     if not output_path:
@@ -94,23 +142,41 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
         # temp file exists
         with open(output_path) as pfile:
             for idx, pline in enumerate(pfile):
-                s = pline.strip().split('\t')
-                chrom, pos, pred_true = s[0], s[1], float(s[2])
+                s = pline.strip().split()
+                chrom, pos = s[0], s[1]
                 pos_key = 'chrom%spos%s' % (chrom, pos)
                 positions_completed[pos_key] = True
 
-    model = get_model()
+    model = get_model(args)
     
     assert model is not None
     
-    channel_means = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_MEANS_PATH))
-    channel_stds = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_STD_DEVS_PATH))
+    if args.normal_bam and not args.ffpe:
+        # tumor-normal frozen
+        channel_means = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_MEANS_PATH))
+        channel_stds = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_STD_DEVS_PATH))
+    else:
+        # tumor only frozen or ffpe
+
+        # <load mean/std for tumor-only convnet trained on experiment 9>
+        channel_means = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_MEANS_PATH))
+        channel_stds = np.load(os.path.join(CURRENT_DIR, c.NORMALIZATION_STD_DEVS_PATH))
+        # </load mean/std for tumor-only convnet trained on experiment 9>
+
+        # <load mean/std for tumor-only convnet encoding>
+        # channel_means = np.load(os.path.join(CURRENT_DIR, c.TUMOR_ONLY_NORMALIZATION_MEANS_PATH))
+        # channel_stds = np.load(os.path.join(CURRENT_DIR, c.TUMOR_ONLY_NORMALIZATION_STD_DEVS_PATH))
+        # <load mean/std for tumor-only convnet encoding>
+        
+        # < set to None for transformer, no need normalization>
+        # channel_means, channel_stds = None, None 
+        # </ set to None for transformer, no need normalization>        
 
     positions_iterator = positions_to_predict.iterrows()
     positions = []
 
     for i, row in positions_iterator:
-        positions.append((row['pos'], row['chrom']))
+        positions.append((row['pos'], row['chrom'], row['REF'], row['ALT'], row['DP'], row['RO'], row['AO'], row['AF']))
 
     if args.update_batch_norm:
         update_batch_norm_fn(model, positions, bamfile_n, bamfile_t, channel_means, channel_stds, ref_file=ref_file, create_input_fn=create_input_tensor_for_position, predict_fn=predict_position)
@@ -121,74 +187,33 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
         random.shuffle(positions) # shuffle positions for TTT
 
     for i, row in enumerate(positions):
-        start_time = time()
-        pos = row[0]
-        chrom = row[1]
+        pos, chrom, REF, ALT, DP, RO, AO, AF = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
         
         pos_key = 'chrom%spos%s' % (chrom, pos)
 
         if pos_key in positions_completed:
             continue
 
-        if deep_sequencing:
-            '''
-            Sampling reads
-            '''
-            n = bamfile_n.count_coverage(chrom, pos, pos + 1)
-            normal_depth = int(n[0][0] + n[1][0] + n[2][0] + n[3][0])
-            n = bamfile_t.count_coverage(chrom, pos, pos+1)
-            tumor_depth = int(n[0][0] + n[1][0] + n[2][0] + n[3][0])
-       
-            max_depth = max(tumor_depth, normal_depth)
-
-            if max_depth <= 100:
-                # Not more than 100 reads here
-                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-                pred_true = predict_position(input_tensor, model, channel_means, channel_stds)
-
-            else:        
-                num_read_samples = max_depth/c.NUM_READS
-                assert num_read_samples > 0
-    
-                pred_trues = []
-
-                print((normal_depth, tumor_depth, max_depth))
-                print(num_read_samples)
-
-                print('...samping reads...')
-                print(('chrom %s pos %s' % (chrom, str(pos))))
-
-                for s in range(num_read_samples):
-                    input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, sample_reads=True)
-                    pred_true = predict_position(input_tensor, model, channel_means, channel_stds)
-                    pred_trues.append(pred_true)
-            
-                from numpy import median
-                pred_true = median(pred_trues)
-   
-                print(pred_trues)
-                print((median(pred_trues)))
-
+        if c.TEST_TIME_TRAINING:
+            input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+            test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
+            pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds, args=args)
         else:
-#            try:
-#                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-#            except Exception as e:
-#                print(('Exception in creating input tensor;', chrom, pos))
-#                print(e)
-#                continue
-        
-            if c.TEST_TIME_TRAINING:
+            if args.normal_bam and not args.ffpe:
+                # convnet2 tumor-normal
                 input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-                test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
-                pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds)
-
             else:
+                # convnet2 tumor only encoding
                 input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-                pred_true = predict_position(input_tensor, model, channel_means, channel_stds)
 
-        results_dict = {'chrom': chrom, 'pos': pos, 'pred_true': pred_true}
+                # tumor-only transformer encoding
+                # input_tensor = create_tumor_only_input_tensor_for_position(chrom, pos, bamfile_t, ref_file)
+
+            pred_true = predict_position(input_tensor, model, channel_means, channel_stds, args=args)
+
+        results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
         
-        results = results.append(results_dict, ignore_index = True)
+        results = results.append(results_dict, ignore_index=True)
 
         if len(results) > 100:
             # append predictions to the file every 1000 predictions

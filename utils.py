@@ -2,9 +2,37 @@ import os
 import numpy as np
 import random
 
+def load_npz(file):
+    loaded = np.load(file, allow_pickle=True)
+    X = np.asarray(loaded['data']).item()
+    return X
+
 def get_ref_file(path):
     import pysam
     return pysam.FastaFile(path)
+
+def split_model_weights(filepath):
+    import h5py
+    assert os.path.exists(filepath), 'file does not exist'
+    m=h5py.File(filepath)
+    splits = 5
+
+    random.seed(1)
+    file_keys = list(m.keys())
+    random.shuffle(file_keys) # shuffle so the file size is evenly split
+    file_keys = np.array_split(file_keys, splits)
+
+    for _ in range(splits):
+        split_filename = filepath.replace('.hdf5','._split_%d.hdf5' % _)
+        split_file = h5py.File(split_filename, 'a')
+
+        for key in file_keys[_]:
+            m.copy(key, split_file)
+
+        split_file.close()
+        print('Saved:', split_filename)
+
+    m.close()
 
 def sample_reads_fn(reads, n, seed=1):
     num_reads = len(reads)

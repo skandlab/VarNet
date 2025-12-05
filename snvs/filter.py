@@ -6,6 +6,7 @@ import gc
 import os
 
 import snvs.constants as c
+from snvs.generate_training_data import get_ref_base, get_reads, is_usable_read
 
 def has_hard_or_soft_clips_in_the_middle(read):
     cigar = read.cigarstring # e.g. 1S2D3M
@@ -70,7 +71,6 @@ def goldset_pre_filters(sample_name, bamname_n, bamname_t, chrom, start, end, ba
         print(("Skipping %s as it exists" % batch_filename))
         return
 
-    regiontime = time()
     bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
     bamfile_t = pysam.AlignmentFile(bamname_t, 'rb')
 
@@ -173,16 +173,142 @@ def goldset_pre_filters(sample_name, bamname_n, bamname_t, chrom, start, end, ba
 
     print(("Saved batch %s" % batch_filename))
 
-def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, output_filename=None):
+def ffpe_filter_snvs(bamname_n, bamname_t, snv_candidates_file):
+    bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
+    bamfile_t = pysam.AlignmentFile(bamname_t, 'rb')
+  
+    output_file = snv_candidates_file.replace('.csv','.npy')
+    if os.path.exists(output_file):
+        print('FFPE data file exists, deleting...', output_file)
+        os.remove(output_file)
+    
+    data = {} 
+    map_dict = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+ 
+    candidates = open(snv_candidates_file)
+    candidates_list = []
+
+    for line in candidates:
+        line = line.strip().split()
+        chrom, pos = line[0], int(line[1]) # 0-indexed snv pos
+        candidates_list.append([chrom,pos])
+
+    from random import shuffle
+    shuffle(candidates_list)
+        
+    #candidates_list = candidates_list[:500000] # limit 500k
+    
+    for idx, site in enumerate(candidates_list):
+        chrom, pos = site[0], site[1]
+        coverage_n = bamfile_n.count_coverage(chrom, pos, pos+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+        coverage_t = bamfile_t.count_coverage(chrom, pos, pos+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+
+        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
+        coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
+            for i in range(len(coverage_n[0]))]
+
+        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in tumor
+        coverage_list_t = [(coverage_t[0][i], coverage_t[1][i], coverage_t[2][i], coverage_t[3][i]) 
+            for i in range(len(coverage_t[0]))]
+
+        #print(chrom, pos)
+        reads = get_reads(bamfile_t, chrom, pos, pos+1)
+
+        #print('normal', coverage_list_n)
+        #print('tumor', coverage_list_t)
+
+        max_frequency_base_in_normal = max(enumerate( coverage_list_n[0] ), key=operator.itemgetter(1))
+        normal_allele = map_dict[max_frequency_base_in_normal[0]]
+
+        alt_allele, alt_allele_count = None, 0
+        for j in range(len(coverage_list_t[0])):
+                if j != max_frequency_base_in_normal[0]: # not the normal allele
+                    if coverage_list_t[0][j] > alt_allele_count: # find alt allele with max count
+                        alt_allele_count = coverage_list_t[0][j]
+                        alt_allele = map_dict[j]
+
+        #print('normal allele:', normal_allele)
+        #print('alt allele:', alt_allele)
+        
+        alt_reads = []
+        for read in reads:
+            aligned_pairs = read.get_aligned_pairs()
+            for p in aligned_pairs:
+                read_pos, ref_pos = p[0], p[1]
+                # check that p[0] is not None i.e. deletion
+                if ref_pos == pos and read_pos is not None and read.query_sequence[read_pos] == alt_allele:
+                    alt_reads.append(read)
+
+        read1_alt_reads, forward_alt_reads = 0, 0
+        for read in alt_reads:
+            if read.is_read1:
+                read1_alt_reads += 1
+            if not read.is_reverse:
+                forward_alt_reads += 1
+
+        pos_key = 'chrom%spos%d' % (chrom, pos)
+        data[pos_key] = {'normal_allele': normal_allele, 'alt_allele': alt_allele, 'alt_reads_count': len(alt_reads), 'read1_alt_reads': read1_alt_reads, 'forward_alt_reads': forward_alt_reads, 'total_tumor_reads': len(reads), 'coverage_list_n': coverage_list_n[0],\
+        'coverage_list_t': coverage_list_t[0]}
+        #print(data)
+        
+        if idx % 1000 == 0:
+            # save every 1000 sites
+            np.save(output_file, data)
+            print('Saved:', output_file)
+ 
+    np.save(output_file, data)   
+    print('Saved:', output_file) 
+
+def get_snv(coverage_list, REFERENCE_ALLELE):
+    """
+    coverage_list = [#A, #C, #G, #T] for site
+    """
+    ALLELES = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+    ALLELE_INDICES = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+
+    try:
+        REFERENCE_ALLELE_COUNT = coverage_list[ALLELE_INDICES[REFERENCE_ALLELE]]
+    except KeyError:
+        # if the reference allele is ambiguous, 'N'
+        REFERENCE_ALLELE_COUNT = 0
+
+    DEPTH = sum(coverage_list)
+
+    if REFERENCE_ALLELE in ALLELE_INDICES: # can be 'N'
+        # find max count allele in tumor that is not reference allele
+        alt_allele_count, alt_allele_index = -1, None
+        for idx, i in enumerate(coverage_list):
+            if i > alt_allele_count and idx != ALLELE_INDICES[REFERENCE_ALLELE]:
+                alt_allele_count, alt_allele_index = i, idx
+
+        ALT_ALLELE = ALLELES[alt_allele_index]
+        ALT_ALLELE_READ_COUNT = alt_allele_count
+
+        if DEPTH > 0:
+            ALT_ALLELE_FRACTION = round(float(ALT_ALLELE_READ_COUNT)/float(DEPTH), 4)
+        else:
+            ALT_ALLELE_FRACTION = 0
+    else:
+        # ref allele is 'N' or something not ACGT, can't figure out ALT allele
+        ALT_ALLELE = 'N'
+        ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION = 0,0
+
+    return (REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION)
+
+def filter_snvs(candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num, output_filename=None):
 
     output_file = os.path.join(candidates_folder, 'batch_%s.csv' % str(batch_num) )
 
     if os.path.exists(output_file):
         print(("SNV BATCH COMPELTE:", output_file))
         return
+    
+    if bamname_n:
+        bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
+    else:
+        # tumor-only mode
+        bamfile_n = None
 
-    regiontime = time()
-    bamfile_n = pysam.AlignmentFile(bamname_n, 'rb')
     bamfile_t = pysam.AlignmentFile(bamname_t, 'rb')
 
     candidates = []
@@ -190,8 +316,15 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, out
     for region in regions:
         chrom, start, end = region[0], region[1], region[2]
 
+        reference_bases = get_ref_base(start, chrom, ref_file, end_pos=end + 1)
+
         try:
-            coverage_n = bamfile_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+            if bamfile_n:
+                coverage_n = bamfile_n.count_coverage(chrom, start, end+1, quality_threshold=c.MIN_BASE_QUALITY, read_callback = check_read)
+            else:
+                # tumor-only mode
+                coverage_n = None
+
         except ValueError:
             if chrom == 'MT':
                 # MT is chrM in hg19
@@ -220,10 +353,14 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, out
                 print("Region does not exist in tumor BAM")
                 return
 
-        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
-        coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
-            for i in range(len(coverage_n[0]))]
-        del coverage_n
+        if coverage_n:
+            # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
+            coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
+                for i in range(len(coverage_n[0]))]
+            del coverage_n
+        else:
+            # tumor-only mode
+            coverage_list_n = None
 
         # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in tumor
         coverage_list_t = [(coverage_t[0][i], coverage_t[1][i], coverage_t[2][i], coverage_t[3][i]) 
@@ -234,22 +371,35 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, out
         gc.collect()
 
         map_dict = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+        reverse_map_dict = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
         
-        for i in range(len(coverage_list_n)):
-
+        for i in range(len(coverage_list_t)):
             pos_key = 'chrom%spos%d' % (chrom, start+i)
 
-            coverage_of_normal = sum(coverage_list_n[i])
-            coverage_of_tumor = sum(coverage_list_t[i])
-
             # Skip if either normal or tumor coverage is low
-            if coverage_of_normal < c.MIN_COVERAGE or coverage_of_tumor < c.MIN_COVERAGE:
+            if coverage_list_n:
+                coverage_of_normal = sum(coverage_list_n[i])
+                if coverage_of_normal < c.MIN_COVERAGE:
+                    continue
+
+            coverage_of_tumor = sum(coverage_list_t[i])
+            if coverage_of_tumor < c.MIN_COVERAGE:
                 continue
 
             # see if a variant allele is found with more than threshold frequency in tumor
             # assuming homozygosity
-            max_frequency_base_in_normal = max(enumerate( coverage_list_n[i] ), key=operator.itemgetter(1))
+            if coverage_list_n:
+                max_frequency_base_in_normal = max(enumerate( coverage_list_n[i] ), key=operator.itemgetter(1)) # (max_index, max_element)
+                baseline_allele = max_frequency_base_in_normal[0]
+            else:
+                # tumor-only mode, compare REFERENCE base instead
+                if reference_bases[i] in reverse_map_dict:
+                    baseline_allele = reverse_map_dict[reference_bases[i]]
+                else:
+                    # reference is 'N' or something other than A,T,G,C
+                    baseline_allele = None
 
+            REFERENCE_ALLELE = reference_bases[i]
             is_candidate_position = False
 
             """
@@ -260,29 +410,32 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, regions, batch_num, out
 
             for j in range(len(coverage_list_t[i])):
 
-                if j != max_frequency_base_in_normal[0]:
-                    # checking alternate alleles in tumor
+                if j == baseline_allele:
+                    continue
 
-                    allele_frequency_high = (coverage_list_t[i][j] / coverage_of_tumor) >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR        
-                    allele_read_count_high = coverage_list_t[i][j] >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
-                    allele_frequency_low_in_normal = (coverage_list_n[i][j] / coverage_of_normal) <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
-                
-                    is_potential_mutation = allele_frequency_high and allele_read_count_high and allele_frequency_low_in_normal
+                # checking alternate alleles in tumor
 
-                    if is_potential_mutation:
-                        is_candidate_position = True
-                        break
+                allele_frequency_high = (coverage_list_t[i][j] / coverage_of_tumor) >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR        
+                allele_read_count_high = coverage_list_t[i][j] >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
+                is_potential_mutation = allele_frequency_high and allele_read_count_high
+
+                if coverage_list_n:
+                    # normal-tumor mode; check that normal AF for variant is low
+                    allele_frequency_low_in_normal = (coverage_list_n[i][j] / coverage_of_normal) <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL    
+                    is_potential_mutation = is_potential_mutation and allele_frequency_low_in_normal
+
+                if is_potential_mutation:
+                    is_candidate_position = True
+                    break
 
             if is_candidate_position:
-                candidates.append((chrom, start + i))
-
-    # create folder for batches for this sample
-    #if not os.path.exists(os.path.join(c.filtering_folder, c.filtering_batches_folder, sample_name)):
-    #    os.makedirs(os.path.join(c.filtering_folder, c.filtering_batches_folder, sample_name))
+                # get INFO for candidate variant site
+                REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION = get_snv(coverage_list_t[i], REFERENCE_ALLELE)
+                candidates.append((chrom, start + i, REFERENCE_ALLELE, ALT_ALLELE, str(DEPTH), str(REFERENCE_ALLELE_COUNT), str(ALT_ALLELE_READ_COUNT), str(ALT_ALLELE_FRACTION)))
 
     # save batch.csv
-    with open(output_file, 'a') as f:
+    with open(output_file, 'w') as f:
         for pos in candidates:
-            f.write('%s\t%s\n' % (pos[0], pos[1]))
+            f.write('%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' % (pos[0], pos[1], pos[2], pos[3], pos[4], pos[5], pos[6], pos[7]))
 
     print(('COMPLETED SNV BATCH: ', output_file)) 
