@@ -101,7 +101,7 @@ def split_chrom(chrom_range, args):
 
     return new_ranges
 
-def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed):
+def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed, whitelist_vcf):
     """
     filter any somatic variant candidate overlapping any dbSNP COMMON variant
     dbSNP_variants_0_indexed
@@ -111,6 +111,26 @@ def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed):
     filtered_candidates_file = path_to_candidates.replace('.csv', '.dbSNP.filtered.csv')
     out = open(filtered_candidates_file, 'w')
     
+    whitelist_sites = {}
+    if whitelist_vcf:
+        if whitelist_vcf.endswith('.gz'):
+            import gzip
+            f = gzip.open(whitelist_vcf)
+        else:
+            f = open(whitelist_vcf)
+
+        whitelist_sites = {}
+
+        for line in f:
+            line = line.decode("utf-8") # convert bytes to string
+            line = line.strip()
+            if line.startswith('#'): continue
+            CHROM, POS = line.split()[0], int(line.split()[1])-1 # convert to 0-indexed
+
+            whitelist_sites[f'CHROM{CHROM}POS{POS}'] = True
+
+        f.close()
+
     for line in candidates_file:
         s=line.strip().split()
         CHROM, POS, REF, ALT = s[0], int(s[1]), s[2], s[3] # position is 0-indexed in candidates file
@@ -121,7 +141,7 @@ def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed):
         pos_key = f'CHROM{CHROM}POS{POS}' # 0-indexed pos, for build 156
         # pos_key = f'CHROM{CHROM}POS{POS}REF{REF}ALT{ALT}' # 0-indexed pos, for build 156
         
-        if pos_key in dbSNP_variants_0_indexed:
+        if pos_key in dbSNP_variants_0_indexed and pos_key not in whitelist_sites:
             filtered_candidates_count += 1
         else:
             out.write(line)
@@ -133,7 +153,51 @@ def dbSNP_filtering(path_to_candidates, dbSNP_variants_0_indexed):
     print('dbSNP filtered variants count:', filtered_candidates_count)
     print('Saved dbSNP filtered variant candidates:', path_to_candidates)
 
-def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed):
+def load_pon(filename='1000g_pon.hg38.vcf.gz'):
+    import gzip
+    x=gzip.open('1000g_pon.hg38.vcf.gz', 'rt')
+    pon={}
+    for line in x:
+        if line[0]=='#': continue
+        chrom,pos=line.split()[0], line.split()[1] # 1-indexed pos from vcf
+        pon[f'{chrom}pos{pos}']=True
+    x.close()
+    return pon
+
+def pon_filtering(path_to_candidates, pon):
+    """
+    filter any somatic variant candidate overlapping any pon site
+    """
+    candidates_file = open(path_to_candidates)
+    filtered_candidates_count = 0
+    filtered_candidates_file = path_to_candidates.replace('.csv', '.pon.filtered.csv')
+    
+    out = open(filtered_candidates_file, 'w')
+    
+    for line in candidates_file:
+        s=line.strip().split()
+        chrom, pos, REF, ALT = s[0], int(s[1]), s[2], s[3] # position is 0-indexed in candidates file
+    
+        pos_key = f'{chrom}pos{pos+1}' # convert to 1-indexed pos
+        
+        if pos_key in pon:
+            filtered_candidates_count += 1
+        else:
+            out.write(line) # write 0-indexed position back to file
+        
+    out.close()
+    os.remove(path_to_candidates)
+    os.rename(filtered_candidates_file, path_to_candidates)
+
+    print('PoN filtered variants count:', filtered_candidates_count)
+    print('Saved PoN filtered variant candidates:', path_to_candidates)
+
+def load_npz_part_single(filename, part_name):
+    """Loads a specific part from the single NPZ file."""
+    data = np.load(filename, allow_pickle=True)
+    return data[part_name].item()  # Convert back to a dictionary
+
+def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed, whitelist_vcf):
     """
     filter any somatic variant candidate overlapping any gnomAD PASS variant AF > 0
     """
@@ -142,7 +206,27 @@ def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed):
     filtered_candidates_file = path_to_candidates.replace('.csv', '.gnomAD.filtered.csv')
     
     out = open(filtered_candidates_file, 'w')
-    
+
+    whitelist_sites = {}
+    if whitelist_vcf:
+        if whitelist_vcf.endswith('.gz'):
+            import gzip
+            f = gzip.open(whitelist_vcf)
+        else:
+            f = open(whitelist_vcf)
+
+        whitelist_sites = {}
+
+        for line in f:
+            line = line.decode("utf-8") # convert bytes to string
+            line = line.strip()
+            if line.startswith('#'): continue
+            CHROM, POS, REF, ALT = line.split()[0], int(line.split()[1]), line.split()[3], line.split()[4] # vcf POS is 1-indexed
+
+            whitelist_sites[f'CHROM{CHROM}POS{POS}REF{REF}ALT{ALT}'] = True
+
+        f.close()
+
     for line in candidates_file:
         s=line.strip().split()
         chrom, pos, REF, ALT = s[0], int(s[1]), s[2], s[3] # position is 0-indexed in candidates file
@@ -150,7 +234,7 @@ def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed):
         # pos_key = 'CHROM%sPOS%d' % (chrom, pos+1) # convert to 1-indexed pos for gnomAD dict
         pos_key = 'CHROM%sPOS%dREF%sALT%s' % (chrom, pos+1, REF, ALT) # convert to 1-indexed pos for gnomAD dict
 
-        if pos_key in gnomAD_variants_1_indexed:
+        if pos_key in gnomAD_variants_1_indexed and pos_key not in whitelist_sites:
             filtered_candidates_count += 1
         else:
             out.write(line) # write 0-indexed position back to file
@@ -159,8 +243,10 @@ def gnomAD_filtering(path_to_candidates, gnomAD_variants_1_indexed):
     os.remove(path_to_candidates)
     os.rename(filtered_candidates_file, path_to_candidates)
 
-    print('gnomAD filtered variants count:', filtered_candidates_count)
-    print('Saved gnomAD filtered variant candidates:', path_to_candidates)
+    #print('gnomAD filtered variants count:', filtered_candidates_count)
+    #print('Saved gnomAD filtered variant candidates:', path_to_candidates)
+
+    return filtered_candidates_count
 
 def parse_germline_vcf(path):
     """
@@ -239,6 +325,12 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
 
     sample_folder = os.path.join(args.output_dir, sample_name)
 
+    output_vcf = os.path.join(sample_folder, sample_name + '.vcf')
+    if (os.path.exists(output_vcf) or os.path.exists(output_vcf + '.gz')):
+        print("VCF file exists for sample. Use new output_dir to re-run sample or delete the VCF to re-generate in current output dir.")
+        print(("VCF:", output_vcf))
+        return
+
     create_folder(sample_folder)
     print(("Sample Output: %s\n" % sample_folder))
 
@@ -292,8 +384,8 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
 
         del germline_sites
         
-    # dbSNP filtering for tumor-only mode
-    if not bamname_n and not args.no_gnomad_dbsnp:
+    # gnomAD-dbSNP filtering for tumor-only mode
+    if (not args.no_gnomad_dbsnp and not bamname_n) or args.gnomad_dbsnp:
         # tumor-only mode, fetch dbSNP variant sites
         if args.reference_build == 'grch37':
             # Note: Grch37 currently not supported. To support GRch37, need to map chromosome names from the fasta file version (e.g. 1, 2, 3, GL000231.1, MT) to (chr1, chr2, chrUn_gl000231, chrM) to match what the dbSNP dictionary is using
@@ -308,20 +400,33 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
         snv_candidates_file = os.path.join(snv_candidates_folder, c.filtered_positions_file)
         indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
 
-        if not args.indel: dbSNP_filtering(snv_candidates_file, dbSNP_variants_0_indexed)
-        if not args.snv: dbSNP_filtering(indel_candidates_file, dbSNP_variants_0_indexed)
+        if not args.indel: dbSNP_filtering(snv_candidates_file, dbSNP_variants_0_indexed, args.whitelist_vcf)
+        if not args.snv: dbSNP_filtering(indel_candidates_file, dbSNP_variants_0_indexed, args.whitelist_vcf)
 
         del dbSNP_variants_0_indexed # delete to free up memory
 
         # load gnomAD 
         # gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.CHROMPOS.npz') # CHROMPOS: True
         # gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.with_AF.npz') # CHROMPOSREFALT: AF, needs 100GB memory to load
-        gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.npz') # CHROMPOSREFALT: True
+        #gnomAD_variants_1_indexed = load_npz('combined_gnomAD_v4.1_genomes_exomes_dict.hg38.npz') # CHROMPOSREFALT: True
+       
+        # load gnomAD in chunks to lower memory need
+        filtered_candidates_count = 0
+        for part in list(range(1,21)): # [1,...,20]
+            gnomAD_variants_1_indexed = load_npz_part_single("combined_gnomAD_v4.1_genomes_exomes_dict.hg38.chunks.npz", f"part_{part}") # CHROMPOSREFALT: True
         
-        if not args.indel: gnomAD_filtering(snv_candidates_file, gnomAD_variants_1_indexed)
-        if not args.snv: gnomAD_filtering(indel_candidates_file, gnomAD_variants_1_indexed)
+            if not args.indel: filtered_candidates_count += gnomAD_filtering(snv_candidates_file, gnomAD_variants_1_indexed, args.whitelist_vcf)
+            if not args.snv: filtered_candidates_count += gnomAD_filtering(indel_candidates_file, gnomAD_variants_1_indexed, args.whitelist_vcf)
 
-        del gnomAD_variants_1_indexed # delete to free up memory
+            del gnomAD_variants_1_indexed # delete to free up memory
+        
+        print('gnomAD filtered variants count:', filtered_candidates_count)
+
+        ## load 1000genomes PoN
+        #pon = load_pon('1000g_pon.hg38.vcf.gz')
+        #pon_filtering(snv_candidates_file, pon)
+        #pon_filtering(indel_candidates_file, pon)
+        #del pon
 
     if args.ffpe:
         print('===> ADDITIONAL FFPE FILTERING <===')
@@ -373,7 +478,9 @@ def parse_args():
     parser.add_argument('-indel', action='store_true') # read as indel_only
     parser.add_argument('-ffpe', action='store_true') # ffpe sample
     parser.add_argument('--germline_vcf', required=False, type=str, default=None)
-    parser.add_argument('--no_gnomad_dbsnp', action='store_true', help='do germline filtering using gnomad and dbsnp')
+    parser.add_argument('--gnomad_dbsnp', action='store_true', help='do germline filtering using gnomad and dbsnp')
+    parser.add_argument('--no_gnomad_dbsnp', action='store_true', help='dont do germline filtering using gnomad and dbsnp')
+    parser.add_argument('--whitelist_vcf', required=False, type=str, default=None, help='list of variants to whitelist during germline filtering using gnomAD/dbSNP (for tumor-only mode)')
     return parser.parse_args()
 
 if __name__ == '__main__':

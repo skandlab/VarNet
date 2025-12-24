@@ -314,6 +314,8 @@ TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(indel_model_folder, 'model.bes
 NORMALIZATION_MEANS_PATH = os.path.join(indel_model_folder, channels_means_file)
 NORMALIZATION_STD_DEVS_PATH = os.path.join(indel_model_folder, channels_std_devs_file)
 
+INDEL_ADAPTED_TUMOR_NORMAL_MODEL = 'adapted_indel_tumor_normal_model.hdf5'
+
 ## CURRENT EXPERIMENT
 def set_experiment_paths(experiment_id):
     global CURRENT_EXPERIMENT_ID

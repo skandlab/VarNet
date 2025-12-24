@@ -51,12 +51,12 @@ def concatenate_batch_prediction_results(predictions_folder):
     for f in batch_prediction_files:
        os.remove(f)
 
-def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
+def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=False):
     from datetime import datetime
 
     ref_file = get_ref_file(args.reference)
-
-    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf.gz')
+    
+    output_vcf = os.path.join(sample_folder, args.sample_name + f'{".adapted" if adapted else ""}.vcf.gz')
 
     if os.path.exists(output_vcf):
         print("VCF file exists for sample. Delete the VCF to re-generate in current output dir.")
@@ -95,10 +95,6 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
     ALLELES = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
     ALLELE_INDICES = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
     
-    if args.threshold is not None:
-        CUT_OFF = args.threshold
-        print('>>> VCF minimum score threshold:', CUT_OFF)
-
     if args.ffpe:
         # retain all calls from original args.vcf
         CUT_OFF = 0
@@ -107,7 +103,11 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
         CUT_OFF = 0
     else:
         # tumor-normal frozen
-        CUT_OFF = 0.3
+        CUT_OFF = 0.1 # 0.3
+
+    if args.threshold is not None:
+        CUT_OFF = args.threshold
+        print('>>> VCF minimum score threshold:', CUT_OFF)
 
     if args.normal_bam and not args.ffpe:
         # don't use normal sample for ffpe (no need as initial variant calling should have removed germline filters, if normal bam available)
@@ -287,11 +287,17 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
         parse_indel_predictions(indel_predictions_file)
 
     vcf_write.close()
+    
+    final_vcf = output_vcf.replace('.temp.vcf.gz', '.vcf.gz')
+    os.rename(output_vcf, final_vcf)
 
-    os.rename(output_vcf, output_vcf.replace('.temp.vcf.gz', '.vcf.gz'))
-    output_vcf = output_vcf.replace('.temp.vcf.gz', '.vcf.gz')
+    if not args.normal_bam:
+        # tumor-only, do PoN subtraction
+        pon_vcf = final_vcf.replace('.vcf.gz', '.pon.vcf')
+        os.system(f'bedtools subtract -a {final_vcf} -b 1000g_pon.hg38.vcf.gz -header > {pon_vcf} && gzip {pon_vcf} && mv {pon_vcf}.gz {final_vcf}')
+        print('>>> Panel of normal subtraction complete.')
 
-    print(("Output VCF:", output_vcf))
+    print("Output VCF:", final_vcf)
 
 def check_batches_complete(predictions_folder, candidates_path):
     # checks if the predictions folder has preds for all candidates
@@ -400,16 +406,7 @@ def parse_vcf(vcf_file, filename, snv=True, PASS_only=True):
 
     print('Extracted', count, 'SNVs' if snv else 'indels', 'from', vcf_file)
 
-def main():
-    sample_folder = os.path.join(args.output_dir, args.sample_name)
-    create_folder(sample_folder)
-
-    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf')
-    if os.path.exists(output_vcf):
-        print("VCF file exists for sample. Use new output_dir to re-run sample or delete the VCF to re-generate in current output dir.")
-        print(("VCF:", output_vcf))
-        return
-
+def main(adapted=False):
     if args.ffpe:
         # extract candidates from args.vcf
         candidates_folder = os.path.join(sample_folder, c.sample_candidates_folder)
@@ -473,7 +470,7 @@ def main():
             snv_candidate_batches = [_ for _ in snv_candidate_batches if len(_)]
 
             try:
-                Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder) for idx, batch in enumerate(snv_candidate_batches) )
+                Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder, adapted=adapted) for idx, batch in enumerate(snv_candidate_batches) )
             except joblib.my_exceptions.WorkerInterrupt as e:
                 print(('workerinterrupt', e))
 
@@ -508,7 +505,7 @@ def main():
             indel_candidate_batches = [_ for _ in indel_candidate_batches if len(_)]
 
             try:
-                Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder) for idx, batch in enumerate(indel_candidate_batches) )
+                Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder, adapted=adapted) for idx, batch in enumerate(indel_candidate_batches) )
             except joblib.my_exceptions.WorkerInterrupt as e:
                 print(('workerinterrupt', e))
 
@@ -519,7 +516,9 @@ def main():
         filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
     else:
         """ MAKE VCF FILE """
-        make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
+        make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=adapted)
+
+    return snv_predictions_file, indel_predictions_file
 
 def filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
     output_vcf_filename = os.path.join(sample_folder, args.sample_name + '.vcf')
@@ -613,6 +612,7 @@ def parse_args():
     parser.add_argument('--vcf', default=False, type=str, help='VCF file for FFPE prediction') # for FFPE samples, must provide VCF
 
     parser.add_argument('--threshold', default=None, type=float)
+    parser.add_argument('--adapt', action='store_true')
 
     return parser.parse_args()
 
@@ -646,10 +646,42 @@ if __name__ == '__main__':
     elif args.environment == 'nscc':
         ref_path = c.ref_path_on_nscc
         predictions_folder = c.predictions_folder_on_nscc
+
+    sample_folder = os.path.join(args.output_dir, args.sample_name)
+    args.sample_folder = sample_folder
+    create_folder(sample_folder)
+
+    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf')
+    if (os.path.exists(output_vcf) or os.path.exists(output_vcf + '.gz')):
+        print("VCF file exists for sample. Use new output_dir to re-run sample or delete the VCF to re-generate in current output dir.")
+        print(("VCF:", output_vcf))
+    else: 
+        # call main() function
+        main()
+
+    if args.adapt:
+        # fine-tune varnet on test samples
+        from adapt import adapt
+        snv_predictions_file = os.path.join(sample_folder, c.sample_predictions_folder, c.snv_candidates_folder, c.combined_predictions_file)
+        indel_predictions_file = os.path.join(sample_folder, c.sample_predictions_folder, c.indel_candidates_folder, c.combined_predictions_file)
+    
+        if not args.indel:
+            # do snv
+            adapt(sample_folder, snv_predictions_file, args, get_ref_file(args.reference), snv=True)
+        
+        if not args.snv:
+            # do indel
+            adapt(sample_folder, indel_predictions_file, args, get_ref_file(args.reference), snv=False)
+
+        # reset sample predictions folder name for adaptive predictions
+        c.sample_predictions_folder = 'adapted_predictions'
+        
+        # call main function again
+        main(adapted=True)
+
 else:
     ref_path = c.ref_path_on_aquila
     ref_path = c.ref_path_on_nscc
     ref_file = pysam.FastaFile(ref_path)
 
-if __name__ == '__main__':
-    main()
+

@@ -45,7 +45,7 @@ if __name__ == '__main__':
     args = parse_args()
     predictions_folder = c.predictions_folder
 
-def get_model(args):
+def get_model(args, adapted=False):
     from tensorflow.keras.models import model_from_json
 
     if args.normal_bam and not args.ffpe:
@@ -58,11 +58,18 @@ def get_model(args):
         model = model_from_json(model_architecture)
         model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
 
+    elif adapted:
+        # load adapted model
+        from tensorflow.keras.models import load_model
+        model = load_model(os.path.join(args.sample_folder, c.INDEL_ADAPTED_TUMOR_NORMAL_MODEL))
+
     else:
         # frozen tumor-only or ffpe
 
         # <start> tumor-only convnet
         if args.ffpe:
+            raise Exception('which model to load?')
+        elif adapted:
             raise Exception('which model to load?')
         else:
             BEST_MODEL_ARCHITECTURE_PATH = c.TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH
@@ -103,13 +110,17 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
 
     if not training:
         y_pred_test = model.predict(input_tensor)
-        return np.mean(y_pred_test)
+        
+        if c.MULTIPLE_READ_SAMPLES:
+            return np.mean(y_pred_test)
+
+        return y_pred_test
     else:
         # to update batch norm statistics
         y_pred_test = model(input_tensor, training=True)
         return y_pred_test
 
-def predict_indels(positions_to_predict, batch_num, args, indel_predictions_folder, output_path=None, update_batch_norm=False):
+def predict_indels(positions_to_predict, batch_num, args, indel_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
     print(("INDEL PREDICTION BATCH:", batch_num))
 
     if not output_path:
@@ -147,7 +158,7 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
     bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb") # tumor bamfile
     ref_file = get_ref_file(args.reference) #Use one ref file per process due to parallelization issues
 
-    model = get_model(args)
+    model = get_model(args, adapted=adapted)
     assert model is not None
 
     columns = ['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF', 'pred_true']

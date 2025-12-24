@@ -1,2 +1,7 @@
-/media/nvme/kiran/smudl_trained_models/indels/experiment_1/trained_models/model.best.inceptionv3.hdf5
+# normal-tumor models
+/media/nvme/kiran/smudl_trained_models/indels/experiment_1/trained_models/model.best.weights.inceptionv3.hdf5
 /media/nvme/kiran/smudl_trained_models/indels/experiment_1/trained_models/model.best.architecture.inceptionv3.json
+
+# tumor-only models
+/media/nvme/kiran/smudl_trained_models/indels/experiment_1/trained_models/model.best.architecture.inceptionv3_tumor_only.json
+/media/nvme/kiran/smudl_trained_models/indels/experiment_1/trained_models/model.best.weights.inceptionv3_tumor_only.hdf5
