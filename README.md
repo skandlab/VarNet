@@ -100,6 +100,8 @@ To run VarNet-T, simply omit the `--normal_bam` argument to run the analysis on 
 
 This function must be run using the provided latest docker image above. Germline filtering using gnomAD and dbSNP databases (included in our docker image) will be automatically performed, in addition to a panel of normals filter. 
 
+VarNet-T also supports a **--whitelist\_vcf** argument that can be used to exclude any variants that may otherwise be filtered due to their presence in gnomAD or dbSNP. 
+
 ## VarNet Benchmarking Guidance
 We recommend including all variant calls from VarNet's VCF output, not just those marked "PASS," when creating precision-recall curves. The "PASS" designation was determined by a score threshold of 0.5, but using all calls provides a more complete picture of the model's performance across all possible thresholds.
 
