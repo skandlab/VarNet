@@ -94,9 +94,11 @@ In this example the VarNet output VCF file will be saved to `varnet_outputs/drea
 
 ## NEW Tumor-only mode
 
-VarNet now supports a **tumor-only mode** for somatic variant detection.
+VarNet now supports a **tumor-only mode** for somatic variant detection, which uses the VarNet-T tumor-only models.
 
-When running VarNet, simply omit the `--normal_bam` argument to run the analysis on a single tumor BAM file without a matched normal control. The commands remain the same, but the expected input is reduced.
+To run VarNet-T, simply omit the `--normal_bam` argument to run the analysis on a single tumor BAM file without a matched normal control. All commands otherwise remain the same.
+
+This function must be run using the provided latest docker image above. Germline filtering using gnomAD and dbSNP databases (included in our docker image) will be automatically performed, in addition to a panel of normals filter. 
 
 ## VarNet Benchmarking Guidance
 We recommend including all variant calls from VarNet's VCF output, not just those marked "PASS," when creating precision-recall curves. The "PASS" designation was determined by a score threshold of 0.5, but using all calls provides a more complete picture of the model's performance across all possible thresholds.
