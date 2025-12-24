@@ -21,7 +21,7 @@ from snvs.generate_training_data import get_reference, generate_image, populate_
 
 CURRENT_DIR = os.path.dirname(__file__) 
 
-def get_model(args):
+def get_model(args, adapted=False):
     from tensorflow.keras.models import model_from_json
 
     if args.normal_bam and not args.ffpe:
@@ -37,6 +37,12 @@ def get_model(args):
             #model = model_from_json(model_architecture, custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
             model = load_model(os.path.join(CURRENT_DIR, BEST_MODEL_PATH), custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
             assert model.optimizer is not None
+
+        elif adapted:
+            # load adapted model
+            from tensorflow.keras.models import load_model
+            model = load_model(os.path.join(args.sample_folder, c.SNV_ADAPTED_TUMOR_NORMAL_MODEL))
+
         else:
             with open(os.path.join(CURRENT_DIR, BEST_MODEL_ARCHITECTURE_PATH)) as f:
                 model_architecture = f.read()
@@ -48,6 +54,8 @@ def get_model(args):
 
         # <start> tumor-only convnet2
         if args.ffpe:
+            raise Exception('which model to load?')
+        elif adapted:
             raise Exception('which model to load?')
         else:
             BEST_MODEL_ARCHITECTURE_PATH = c.TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH
@@ -97,7 +105,7 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         y_pred_test = model(input_tensor, training=True)
         return y_pred_test
 
-def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, update_batch_norm=False):
+def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
     print(("SNV PREDICTION BATCH:", batch_num))
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
@@ -147,7 +155,7 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
                 pos_key = 'chrom%spos%s' % (chrom, pos)
                 positions_completed[pos_key] = True
 
-    model = get_model(args)
+    model = get_model(args, adapted=adapted)
     
     assert model is not None
     
