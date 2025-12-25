@@ -94,7 +94,7 @@ In this example the VarNet output VCF file will be saved to `varnet_outputs/drea
 
 ## NEW Tumor-only mode
 
-VarNet now supports a **tumor-only mode** for somatic variant detection, which uses the VarNet-T tumor-only models.
+VarNet now supports a **tumor-only mode** for somatic variant detection, which uses the VarNet-T tumor-only models. **The docker image is required to run tumor-only mode.**
 
 To run VarNet-T, simply omit the `--normal_bam` argument to run the analysis on a single tumor BAM file without a matched normal control. All commands otherwise remain the same.
 
