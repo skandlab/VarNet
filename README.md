@@ -68,12 +68,13 @@ By default, VarNet will scan and predict both SNV and INDELs. To scan and predic
 ```
 python filter.py \
     --sample_name dream1 \
-    --normal_bam dream1_normal.bam \
+    --normal_bam dream1_normal.bam (optional, omit for tumor-only mode) \
     --tumor_bam dream1_tumor.bam \
     --processes 2 \
     --output_dir varnet_outputs \
     --reference GRCh38.fa \
     --region_bed region.bed (optional)
+    --whitelist_vcf whitelist.vcf (optional, use only in tumor-only mode)
     -snv (optional flag, for snv filtering only)
     -indel (optional flag, for indel filtering only)
 ```
@@ -81,7 +82,7 @@ python filter.py \
 ```
 python predict.py \
 	--sample_name dream1 \
-	--normal_bam dream1_normal.bam \
+	--normal_bam dream1_normal.bam (optional, omit for tumor-only mode) \
 	--tumor_bam dream1_tumor.bam \
 	--processes 2 \
 	--output_dir varnet_outputs \
