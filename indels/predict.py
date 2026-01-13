@@ -100,6 +100,9 @@ def get_model(args, adapted=False):
     return model
 
 def predict_position(input_tensor, model, channel_means, channel_stds, training=False, args=None):
+    if c.MULTIPLE_READ_SAMPLES:
+        raise Exception("MULTIPLE_READ_SAMPLES is True. Batch prediction requires it to be False.")
+
     if input_tensor.dtype != np.float32:
         input_tensor = input_tensor.astype(np.float32)
 
@@ -109,9 +112,10 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         input_tensor /= channel_stds
 
     if not training:
-        y_pred_test = model.predict(input_tensor)
+        # full batch prediction
+        y_pred_test = model.predict(input_tensor, batch_size=len(input_tensor))
     
-        return np.mean(y_pred_test)
+        return y_pred_test
 
     else:
         # to update batch norm statistics
@@ -201,32 +205,40 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
     if args.update_batch_norm:
         update_batch_norm_fn(model, positions, bamfile_n, bamfile_t, channel_means, channel_stds, ref_file=ref_file, create_input_fn=create_input_tensor_for_position, predict_fn=predict_position)
 
-    for i, row in enumerate(positions):
-        pos, chrom, REF, ALT, DP, RO, AO, AF = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+    batch_size = args.batch_size
+    for i in range(0, len(positions), batch_size):
+        batch = positions[i:i + batch_size]
+        
+        batch_input_tensors = []
+        batch_metadata = []
 
-        pos_key = 'chrom%spos%s' % (chrom, pos)
+        for row in batch:
+            pos, chrom, REF, ALT, DP, RO, AO, AF = row
+            pos_key = 'chrom%spos%s' % (chrom, pos)
 
-        if pos_key in positions_completed:
-            continue
+            if pos_key in positions_completed:
+                continue
 
-        if args.normal_bam and not args.ffpe:
-            # inceptionv3 tumor-normal
-            input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-        else:
-            # inceptionv3 tumor-normal
             input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
 
             # tumor-only transformer encoding
             # input_tensor = create_tumor_only_input_tensor_for_position(chrom, pos, bamfile_t, ref_file)
+            
+            batch_input_tensors.append(input_tensor)
+            batch_metadata.append(row)
 
-        pred_true = predict_position(input_tensor, model, channel_means, channel_stds, args=args)
+        if batch_input_tensors:
+            input_tensor_batch = np.concatenate(batch_input_tensors, axis=0)
+            preds = predict_position(input_tensor_batch, model, channel_means, channel_stds, args=args)
+            
+            for idx, row in enumerate(batch_metadata):
+                pos, chrom, REF, ALT, DP, RO, AO, AF = row
+                pred_true = float(preds[idx])
+                results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
+                results = results.append(results_dict, ignore_index=True)
 
-        results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
-
-        results = results.append(results_dict, ignore_index = True)
-
-        if len(results) > 100:
-            # append predictions to the file every 1000 predictions
+        if len(results):
+            # append predictions to the file every batch
             results.to_csv(output_path, sep='\t', index=False, encoding='utf-8', mode='a', header=False)
             results.drop(results.index, inplace=True)
 

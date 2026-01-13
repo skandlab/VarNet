@@ -252,7 +252,7 @@ NUM_MODEL_OUTPUTS = 1 # number of output logits of the model
 
 SAMPLE_READS = True # sample reads and sort by CO. don't use this when generating training data if you don't want sampling, or set SAMPLE_READS_COUNT to 1. 
 MULTIPLE_READ_SAMPLES = False # if True, create_input_tensor_for_position() will sample multiple sets of reads at each site. If False, samples once. WARNING: This will also affect prediction.
-SAMPLE_READS_COUNT = 20 # 1 for test samples # 20 for training samples WES cohort # 10 for WGS TCGA FFPE cohort # default 1. for use with SAMPLE_READS and MULTIPLE_READ_SAMPLES
+SAMPLE_READS_COUNT = 1 # 20 for training samples WES cohort # 10 for WGS TCGA FFPE cohort # default 1. for use with SAMPLE_READS and MULTIPLE_READ_SAMPLES
 ENCODE_READ_ORIENTATION = False # if True, encodes read orientation in snv input in the same channel as strand bias. Not implemented for indels. WARNING: Will affect prediction
 
 INPUT_WHITENING = False # decorrelate input pixels per channel
@@ -343,6 +343,9 @@ snv_model_folder = 'snv_model'
 NORMALIZATION_MEANS_PATH = os.path.join(snv_model_folder, channels_means_file)
 NORMALIZATION_STD_DEVS_PATH = os.path.join(snv_model_folder, channels_std_devs_file)
 
+# name of tumor-normal convnet2 (snv) adapted per sample
+SNV_ADAPTED_TUMOR_NORMAL_MODEL = 'adapted_snv_tumor_normal_model.hdf5'
+
 # for tumor-only convnet
 TUMOR_ONLY_NORMALIZATION_MEANS_PATH = os.path.join(snv_model_folder, 'tumor_only_channel_means_for_normalization.npy')
 TUMOR_ONLY_NORMALIZATION_STD_DEVS_PATH = os.path.join(snv_model_folder, 'tumor_only_channel_standard_deviations_for_normalization.npy')
@@ -367,21 +370,25 @@ BEST_MODEL_PATH = os.path.join(snv_model_folder, 'model.best.hdf5')
 # TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.tumor_only.architecture.json')
 # TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.tumor_only.weights.hdf5')
 
+# exp 9 tumor only (upweight class 0 by 5)
+#TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.convnet2_tumor_only_class_weight_0_5_class_weight_1_1.json')
+#TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.convnet2_tumor_only_class_weight_0_5_class_weight_1_1.hdf5')
+
 # exp 428 (exp 9 model retrained with germline snvs)
 # TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.tumor_only.exp_428_retrain_with_germline.json')
 # TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.tumor_only.exp_428_retrain_with_germline.hdf5')
 
 # exp 428 (exp 9 model retrained with germline snvs) downsample germline 90pct
-TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_downsample_germline_90pct.json')
-TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_downsample_germline_90pct.hdf5')
+#TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_downsample_germline_90pct.json')
+#TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_downsample_germline_90pct.hdf5')
 
 # exp 428 (exp 9 model retrained with germline snvs) train from scratch
-TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_from_scratch.json')
-TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_from_scratch.hdf5')
+#TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_from_scratch.json')
+#TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_from_scratch.hdf5')
 
 # exp 428 (exp 9 model retrained with germline snvs) train from scratch multi-class
-TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_from_scratch_multi_class.json')
-TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_from_scratch_multi_class.hdf5')
+#TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.retrain_with_germline_from_scratch_multi_class.json')
+#TUMOR_ONLY_BEST_MODEL_WEIGHTS_PATH = os.path.join(snv_model_folder, 'model.best.weights.retrain_with_germline_from_scratch_multi_class.hdf5')
 
 # exp 9 tumor only
 TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH = os.path.join(snv_model_folder, 'model.best.architecture.tumor_only.exp_9.json')
@@ -614,4 +621,4 @@ def set_experiment_name(experiment_name):
 
 set_experiment_name(experiment_name)
 
-__VERSION__ = '1.2.0' # updated to v2 on 24 Nov '25. '1.1.0'
+__VERSION__ = '1.3.0'

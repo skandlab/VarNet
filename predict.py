@@ -613,6 +613,7 @@ def parse_args():
 
     parser.add_argument('--threshold', default=None, type=float)
     parser.add_argument('--adapt', action='store_true')
+    parser.add_argument('--batch_size', default=1000, type=int, help='Batch size for model predictions (default: 1000)')
 
     return parser.parse_args()
 

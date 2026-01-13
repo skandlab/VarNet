@@ -86,20 +86,23 @@ def get_model(args, adapted=False):
     return model
 
 def predict_position(input_tensor, model, channel_means, channel_stds, training=False, args=None):
+    if c.MULTIPLE_READ_SAMPLES:
+        raise Exception("MULTIPLE_READ_SAMPLES is True. Batch prediction requires it to be False.")
+
     if channel_means is not None and channel_stds is not None:
         # normalization not required for tumor-only/FFPE transformers
         input_tensor -= channel_means
         input_tensor /= channel_stds
 
     if not training:
-        y_pred_test = model.predict(input_tensor)
+        # full batch prediction
+        y_pred_test = model.predict(input_tensor, batch_size=len(input_tensor))
         
         if y_pred_test.shape[1] != 1:
             # multi-class output, use somatic proba only
             y_pred_test = y_pred_test[:,1]
             
-        # return mean when c.SAMPLE_READS_COUNT > 1, i.e. multiple random samples of reads for the *same* position. Makes no difference if c.SAMPLE_READS_COUNT=1
-        return np.mean(y_pred_test)
+        return y_pred_test
     else:
         # to update batch norm statistics
         y_pred_test = model(input_tensor, training=True)
@@ -194,37 +197,45 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
         import random
         random.shuffle(positions) # shuffle positions for TTT
 
-    for i, row in enumerate(positions):
-        pos, chrom, REF, ALT, DP, RO, AO, AF = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+    batch_size = args.batch_size
+    for i in range(0, len(positions), batch_size):
+        batch = positions[i:i + batch_size]
         
-        pos_key = 'chrom%spos%s' % (chrom, pos)
+        batch_input_tensors = []
+        batch_metadata = []
 
-        if pos_key in positions_completed:
-            continue
+        for row in batch:
+            pos, chrom, REF, ALT, DP, RO, AO, AF = row
+            pos_key = 'chrom%spos%s' % (chrom, pos)
 
-        if c.TEST_TIME_TRAINING:
-            input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
-            test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
-            pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds, args=args)
-        else:
-            if args.normal_bam and not args.ffpe:
-                # convnet2 tumor-normal
+            if pos_key in positions_completed:
+                continue
+
+            if c.TEST_TIME_TRAINING:
                 input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+                test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
+                pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds, args=args)
+                pred_true = float(pred_true[0])
+                
+                results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
+                results = results.append(results_dict, ignore_index=True)
             else:
-                # convnet2 tumor only encoding
                 input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+                batch_input_tensors.append(input_tensor)
+                batch_metadata.append(row)
 
-                # tumor-only transformer encoding
-                # input_tensor = create_tumor_only_input_tensor_for_position(chrom, pos, bamfile_t, ref_file)
+        if not c.TEST_TIME_TRAINING and batch_input_tensors:
+            input_tensor_batch = np.concatenate(batch_input_tensors, axis=0)
+            preds = predict_position(input_tensor_batch, model, channel_means, channel_stds, args=args)
+            
+            for idx, row in enumerate(batch_metadata):
+                pos, chrom, REF, ALT, DP, RO, AO, AF = row
+                pred_true = float(preds[idx])
+                results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
+                results = results.append(results_dict, ignore_index=True)
 
-            pred_true = predict_position(input_tensor, model, channel_means, channel_stds, args=args)
-
-        results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
-        
-        results = results.append(results_dict, ignore_index=True)
-
-        if len(results) > 100:
-            # append predictions to the file every 1000 predictions
+        if len(results):
+            # append predictions to the file every batch
             results.to_csv(output_path, sep='\t', index=False, encoding='utf-8', mode='a', header=False)
             results.drop(results.index, inplace=True)
 
