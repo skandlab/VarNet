@@ -353,85 +353,104 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, ref_file, regions, batc
                 print("Region does not exist in tumor BAM")
                 return
 
-        if coverage_n:
-            # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in normal
-            coverage_list_n = [(coverage_n[0][i], coverage_n[1][i], coverage_n[2][i], coverage_n[3][i]) 
-                for i in range(len(coverage_n[0]))]
-            del coverage_n
+        # Build (4, L) coverage matrices for vectorized operations
+        # coverage_t is a tuple of 4 arrays from count_coverage
+        coverage_mat_t = np.vstack(coverage_t).astype(np.int32, copy=False)
+        L = coverage_mat_t.shape[1]
+        if L == 0:
+            continue
+
+        if coverage_n is not None:
+            coverage_mat_n = np.vstack(coverage_n).astype(np.int32, copy=False)
         else:
-            # tumor-only mode
-            coverage_list_n = None
+            coverage_mat_n = None
 
-        # [ (#A, #C, #G, #T), (#A, #C, #G, #T), (#A, #C, #G, #T), ] at each position in tumor
-        coverage_list_t = [(coverage_t[0][i], coverage_t[1][i], coverage_t[2][i], coverage_t[3][i]) 
-            for i in range(len(coverage_t[0]))]
-        
-        del coverage_t
-
-        gc.collect()
+        del coverage_n, coverage_t
 
         map_dict = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
         reverse_map_dict = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-        
-        for i in range(len(coverage_list_t)):
-            pos_key = 'chrom%spos%d' % (chrom, start+i)
 
-            # Skip if either normal or tumor coverage is low
-            if coverage_list_n:
-                coverage_of_normal = sum(coverage_list_n[i])
-                if coverage_of_normal < c.MIN_COVERAGE:
-                    continue
+        # Vectorized coverage filters
+        coverage_per_pos_t = coverage_mat_t.sum(axis=0)
+        if coverage_mat_n is not None:
+            coverage_per_pos_n = coverage_mat_n.sum(axis=0)
+            cov_mask = (coverage_per_pos_n >= c.MIN_COVERAGE) & (coverage_per_pos_t >= c.MIN_COVERAGE)
+        else:
+            cov_mask = coverage_per_pos_t >= c.MIN_COVERAGE
 
-            coverage_of_tumor = sum(coverage_list_t[i])
-            if coverage_of_tumor < c.MIN_COVERAGE:
-                continue
+        # Determine baseline (reference) allele per position
+        # In normal-tumor mode: baseline = max allele in normal
+        # In tumor-only mode: baseline = reference base
+        if coverage_mat_n is not None:
+            # Tie-aware: find max counts in normal
+            max_counts_n = coverage_mat_n.max(axis=0)
+            ref_mask = coverage_mat_n == max_counts_n  # shape (4, L), True where allele == max
+        else:
+            # Tumor-only: baseline is reference allele (vectorized)
+            # Map reference bases to row indices: A=0, C=1, G=2, T=3, N/-1=invalid
+            base_to_idx = np.array([
+                reverse_map_dict.get(b, -1) for b in reference_bases
+            ], dtype=np.int8)  # shape (L,)
+            
+            valid_mask = base_to_idx >= 0  # positions with valid ref base (not 'N')
+            ref_mask = np.zeros((4, L), dtype=bool)
+            
+            # Advanced indexing explanation:
+            # valid_cols = column indices where ref base is valid (e.g., [0, 1, 3, 4])
+            # base_to_idx[valid_cols] = row indices for those columns (e.g., [0, 2, 1, 3] for A, G, C, T)
+            # 
+            # ref_mask[rows, cols] = True sets positions (row[i], col[i]) for each i:
+            #   - ref_mask[0, 0] = True  (position 0 has ref 'A', row 0)
+            #   - ref_mask[2, 1] = True  (position 1 has ref 'G', row 2)
+            #   - ref_mask[1, 3] = True  (position 3 has ref 'C', row 1)
+            #   - ref_mask[3, 4] = True  (position 4 has ref 'T', row 3)
+            # This is equivalent to looping but done in one vectorized operation.
+            valid_cols = np.nonzero(valid_mask)[0]
+            ref_mask[base_to_idx[valid_cols], valid_cols] = True
+            # If ref is 'N', that column stays all-False (all alleles are considered alt)
 
-            # see if a variant allele is found with more than threshold frequency in tumor
-            # assuming homozygosity
-            if coverage_list_n:
-                max_frequency_base_in_normal = max(enumerate( coverage_list_n[i] ), key=operator.itemgetter(1)) # (max_index, max_element)
-                baseline_allele = max_frequency_base_in_normal[0]
-            else:
-                # tumor-only mode, compare REFERENCE base instead
-                if reference_bases[i] in reverse_map_dict:
-                    baseline_allele = reverse_map_dict[reference_bases[i]]
-                else:
-                    # reference is 'N' or something other than A,T,G,C
-                    baseline_allele = None
+        alt_mask = ~ref_mask  # shape (4, L)
 
-            REFERENCE_ALLELE = reference_bases[i]
-            is_candidate_position = False
+        # Guard against zero coverage (avoid division by zero)
+        cov_t_safe = np.where(coverage_per_pos_t == 0, 1, coverage_per_pos_t)
 
-            """
-               Filter positions where no alternate allele has freq > c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
-               Filter positions where no alterate allele has more than 2 supporting reads
-               Filter positions where no alternate allele is found in the normal sample with frequency less than c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL    
-            """
+        # Compute alt frequencies in tumor (float64 for precision)
+        alt_freq_t = coverage_mat_t.astype(np.float64) / cov_t_safe  # shape (4, L)
+        alt_reads_t = coverage_mat_t
 
-            for j in range(len(coverage_list_t[i])):
+        # Per-allele filters in tumor
+        tumor_alt_AF_high = alt_freq_t >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR
+        tumor_alt_AR_high = alt_reads_t >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
 
-                if j == baseline_allele:
-                    continue
+        # Normal AF filter (only in normal-tumor mode)
+        if coverage_mat_n is not None:
+            cov_n_safe = np.where(coverage_per_pos_n == 0, 1, coverage_per_pos_n)
+            alt_freq_n = coverage_mat_n.astype(np.float64) / cov_n_safe
+            normal_alt_AF_low = alt_freq_n <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL
 
-                # checking alternate alleles in tumor
+            alt_pass = (
+                alt_mask
+                & tumor_alt_AF_high
+                & tumor_alt_AR_high
+                & normal_alt_AF_low
+            )
+        else:
+            alt_pass = (
+                alt_mask
+                & tumor_alt_AF_high
+                & tumor_alt_AR_high
+            )
 
-                allele_frequency_high = (coverage_list_t[i][j] / coverage_of_tumor) >= c.MIN_MUTANT_ALLELE_FREQUENCY_IN_TUMOR        
-                allele_read_count_high = coverage_list_t[i][j] >= c.MIN_MUTANT_ALLELE_READS_IN_TUMOR
-                is_potential_mutation = allele_frequency_high and allele_read_count_high
+        # Position passes if any alt allele passes all filters
+        any_alt_passes = alt_pass.any(axis=0) & cov_mask
+        candidate_indices = np.nonzero(any_alt_passes)[0]
 
-                if coverage_list_n:
-                    # normal-tumor mode; check that normal AF for variant is low
-                    allele_frequency_low_in_normal = (coverage_list_n[i][j] / coverage_of_normal) <= c.MAX_ALTERNATIVE_ALLELE_FREQUENCY_IN_NORMAL    
-                    is_potential_mutation = is_potential_mutation and allele_frequency_low_in_normal
-
-                if is_potential_mutation:
-                    is_candidate_position = True
-                    break
-
-            if is_candidate_position:
-                # get INFO for candidate variant site
-                REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION = get_snv(coverage_list_t[i], REFERENCE_ALLELE)
-                candidates.append((chrom, start + i, REFERENCE_ALLELE, ALT_ALLELE, str(DEPTH), str(REFERENCE_ALLELE_COUNT), str(ALT_ALLELE_READ_COUNT), str(ALT_ALLELE_FRACTION)))
+        # Convert coverage_mat_t to list form for get_snv (per candidate)
+        for idx in candidate_indices:
+            REFERENCE_ALLELE = reference_bases[idx]
+            coverage_list_t_pos = tuple(coverage_mat_t[:, idx])
+            REFERENCE_ALLELE, ALT_ALLELE, DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT, ALT_ALLELE_FRACTION = get_snv(coverage_list_t_pos, REFERENCE_ALLELE)
+            candidates.append((chrom, start + idx, REFERENCE_ALLELE, ALT_ALLELE, str(DEPTH), str(REFERENCE_ALLELE_COUNT), str(ALT_ALLELE_READ_COUNT), str(ALT_ALLELE_FRACTION)))
 
     # save batch.csv
     with open(output_file, 'w') as f:
