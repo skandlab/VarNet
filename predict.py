@@ -23,6 +23,42 @@ from snvs.predict import predict_snvs
 from indels.filter import get_indels
 from indels.predict import predict_indels
 
+def split_candidates_into_batches(candidates):
+    """
+    Group candidates such that each batch belongs to the same chromosome
+    and the difference between the earliest and latest position is no more than 1Mbp.
+    
+    Args:
+        candidates: DataFrame with 'chrom' and 'pos' columns
+        
+    Returns:
+        List of DataFrame batches (empty batches removed)
+    """
+    if len(candidates) == 0:
+        return []
+    
+    cand_chroms = candidates['chrom'].values
+    cand_pos = candidates['pos'].values
+    split_indices = []
+
+    batch_chrom = cand_chroms[0]
+    batch_start_pos = cand_pos[0]
+
+    for i in range(1, len(candidates)):
+        curr_chrom = cand_chroms[i]
+        curr_pos = cand_pos[i]
+
+        if curr_chrom != batch_chrom or (curr_pos - batch_start_pos) > 1000000:
+            split_indices.append(i)
+            batch_chrom = curr_chrom
+            batch_start_pos = curr_pos
+
+    candidate_batches = np.split(candidates, split_indices)
+    # remove empty batches
+    candidate_batches = [batch for batch in candidate_batches if len(batch)]
+    
+    return candidate_batches
+
 def concatenate_batch_prediction_results(predictions_folder):
     prediction_results_file = os.path.join(predictions_folder, c.combined_predictions_file)
 
@@ -297,6 +333,12 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
         os.system(f'bedtools subtract -a {final_vcf} -b 1000g_pon.hg38.vcf.gz -header > {pon_vcf} && gzip {pon_vcf} && mv {pon_vcf}.gz {final_vcf}')
         print('>>> Panel of normal subtraction complete.')
 
+    # sort vcf
+    print('>>> Sorting VCF...')
+    sorted_vcf = final_vcf.replace('.vcf.gz', '.sort.vcf')
+    os.system(f'bedtools sort -i {final_vcf} -header > {sorted_vcf} && gzip {sorted_vcf} && mv {sorted_vcf}.gz {final_vcf}')
+    print('>>> VCF sorted.')
+
     print("Output VCF:", final_vcf)
 
 def check_batches_complete(predictions_folder, candidates_path):
@@ -460,14 +502,12 @@ def main(adapted=False):
 
             snv_candidates = pd.read_csv(snv_candidates_path, sep='\t', header=None, names=['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF'], dtype={'chrom': str, 'pos': int, 'REF': str, 'ALT': str, 'DP': int, 'RO': int, 'AO': int, 'AF': float})
 
-            # Sort the labels file by position and chromosome and then reindex
-            snv_candidates = snv_candidates.sort_values(['pos'], ascending=[True]).reset_index(drop=True)
+            # Sort the candidates file by chromosome and position and then reindex
+            snv_candidates = snv_candidates.sort_values(['chrom', 'pos'], ascending=[True, True]).reset_index(drop=True)
 
             print(("Number of SNV candidates: ", len(snv_candidates)))
 
-            snv_candidate_batches = np.array_split(snv_candidates, split_num)
-            # remove empty batches
-            snv_candidate_batches = [_ for _ in snv_candidate_batches if len(_)]
+            snv_candidate_batches = split_candidates_into_batches(snv_candidates)
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder, adapted=adapted) for idx, batch in enumerate(snv_candidate_batches) )
@@ -495,14 +535,12 @@ def main(adapted=False):
 
             indel_candidates = pd.read_csv(indel_candidates_path, sep='\t', header=None, names=['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF'], dtype={'chrom': str, 'pos': int, 'REF': str, 'ALT': str, 'DP': int, 'RO': int, 'AO': int, 'AF': float})
 
-            # Sort the labels file by position and chromosome and then reindex
-            indel_candidates = indel_candidates.sort_values(['pos'], ascending=[True]).reset_index(drop=True)
+            # Sort the candidates file by chromosome and position and then reindex
+            indel_candidates = indel_candidates.sort_values(['chrom', 'pos'], ascending=[True, True]).reset_index(drop=True)
 
             print(("Number of INDEL candidates: ", len(indel_candidates)))
 
-            indel_candidate_batches = np.array_split(indel_candidates, split_num)
-            # remove empty batches
-            indel_candidate_batches = [_ for _ in indel_candidate_batches if len(_)]
+            indel_candidate_batches = split_candidates_into_batches(indel_candidates)
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder, adapted=adapted) for idx, batch in enumerate(indel_candidate_batches) )
@@ -613,7 +651,7 @@ def parse_args():
 
     parser.add_argument('--threshold', default=None, type=float)
     parser.add_argument('--adapt', action='store_true')
-    parser.add_argument('--batch_size', default=1000, type=int, help='Batch size for model predictions (default: 1000)')
+    parser.add_argument('--batch_size', default=64, type=int, help='Batch size for model predictions (default: 64)')
 
     return parser.parse_args()
 

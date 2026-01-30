@@ -173,11 +173,9 @@ def encode_deletion(ref_pos, read, encoded_seq, quals):
                                                                 read, ref_pos)
     )
 
-
 def encode_match(read_pos, read, encoded_seq, quals):
     encoded_seq.append(BaseVals.get_base_val(read.query_sequence[read_pos]))
     quals.append(read.query_qualities[read_pos])
-
 
 def get_starting_position_in_image(ref_pos, start_pos, insertions):
     read_starts_at = ref_pos - start_pos
@@ -185,7 +183,6 @@ def get_starting_position_in_image(ref_pos, start_pos, insertions):
         if pos < ref_pos:
             read_starts_at += insertions[pos]
     return read_starts_at
-
 
 def get_bases_to_fill(read, config, insertions):
     encoded_seq = []
@@ -262,7 +259,6 @@ def stack_read_in_image(read, img, i, config, insertions):
 
     return True
 
-
 def generate_image(reads, config, insertions, start_at_read, img):
     image_row = 0
 
@@ -305,7 +301,6 @@ def find_insertion_positions(read, insertions, start, end, position):
             else:
                 ref_pos += items[1]
 
-
 def get_insertions(normal_reads, tumor_reads, position, config):
     insertions = {}
     for read in normal_reads:
@@ -321,7 +316,6 @@ def get_start(position):
 
 def get_end(position):
     return position + c.FLANK + 2
-
 
 def get_config(position, start_pos, end_pos):
     config = {}
@@ -347,17 +341,19 @@ def update_config(config, n_length, t_length, insertions):
             config['insertions_after_middle'] += insertions[ref_pos]
 
 
-def create_input_tensor_for_position(chrX, position, bamfile_n, bamfile_t, ref_file, dtype=np.float32):
+def create_input_tensor_for_position(chrX, position, bamfile_n, bamfile_t, ref_file, dtype=np.float32, normal_reads=None, tumor_reads=None):
     start_pos = get_start(position)
     end_pos = get_end(position)
 
     if bamfile_n:
-        normal_reads = get_reads(bamfile_n, chrX, start_pos, end_pos)
+        if normal_reads is None:
+            normal_reads = get_reads(bamfile_n, chrX, start_pos, end_pos)
     else:
         # tumor only mode
         normal_reads = []
 
-    tumor_reads = get_reads(bamfile_t, chrX, start_pos, end_pos)
+    if tumor_reads is None:
+        tumor_reads = get_reads(bamfile_t, chrX, start_pos, end_pos)
 
     # how many times to sample c.NUM_READS reads from bams
     n_read_samples = 1

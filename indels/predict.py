@@ -22,8 +22,9 @@ from joblib import Parallel, delayed, __version__
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import indels.constants as c
-from indels.generate_training_data_specialized import create_input_tensor_for_position
-from snvs.generate_training_data import create_tumor_only_input_tensor_for_position
+from indels.generate_training_data_specialized import create_input_tensor_for_position, get_start, get_end
+from snvs.generate_training_data import create_tumor_only_input_tensor_for_position, get_reads
+from snvs.predict import subset_reads
 
 from utils import get_ref_file, update_batch_norm_fn
 
@@ -122,6 +123,22 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         y_pred_test = model(input_tensor, training=True)
         return y_pred_test
 
+def get_read_starts(reads):
+    read_starts = []
+    max_read_len = 0
+
+    for r in reads:
+        # 1. Collect the start position
+        start = r.reference_start
+        read_starts.append(start)
+        
+        # 2. Calculate length and update max if it's larger
+        length = r.reference_end - start
+        if length > max_read_len:
+            max_read_len = length
+    
+    return read_starts, max_read_len
+
 def predict_indels(positions_to_predict, batch_num, args, indel_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
     print(("INDEL PREDICTION BATCH:", batch_num))
 
@@ -148,8 +165,8 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
                 pos_key = 'chrom%spos%s' % (chrom, pos)
                 positions_completed[pos_key] = True
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     if args.normal_bam:
         bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb") # normal bamfile
@@ -159,6 +176,19 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
         
     bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb") # tumor bamfile
     ref_file = get_ref_file(args.reference) #Use one ref file per process due to parallelization issues
+
+    # fetch reads for all positions in this batch (they belong to same chromosome and within 10Mbp)
+    region_start, region_end = get_start(positions_to_predict['pos'].values[0]), get_end(positions_to_predict['pos'].values[-1])
+    if args.normal_bam:
+        normal_reads = get_reads(bamfile_n, positions_to_predict['chrom'].values[0], region_start, region_end)
+        normal_read_starts, normal_max_read_len = get_read_starts(normal_reads)
+    else:
+        normal_reads = None 
+        normal_read_starts = []
+        normal_max_read_len = 0
+        
+    tumor_reads = get_reads(bamfile_t, positions_to_predict['chrom'].values[0], region_start, region_end)
+    tumor_read_starts, tumor_max_read_len = get_read_starts(tumor_reads)
 
     model = get_model(args, adapted=adapted)
     assert model is not None
@@ -218,8 +248,26 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
 
             if pos_key in positions_completed:
                 continue
+           
+            # indels have slightly different window calculation in generate_training_data_specialized
+            # get_start: position - c.FLANK + 1
+            # get_end: position + c.FLANK + 2
+            # However, for simply filtering reads that overlap, a slightly larger window or the same window is fine as long as we cover the region.
+            # safe window for filtering:
+            # The exact window used in create_input_tensor_for_position is:
+            start_pos_exact = get_start(pos)
+            end_pos_exact = get_end(pos)
 
-            input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+            if normal_reads:
+                # filter normal
+                current_normal_reads = subset_reads(normal_reads, normal_read_starts, normal_max_read_len, start_pos_exact, end_pos_exact)
+            else:
+                current_normal_reads = None
+
+            # filter tumor
+            current_tumor_reads = subset_reads(tumor_reads, tumor_read_starts, tumor_max_read_len, start_pos_exact, end_pos_exact)
+
+            input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
 
             # tumor-only transformer encoding
             # input_tensor = create_tumor_only_input_tensor_for_position(chrom, pos, bamfile_t, ref_file)

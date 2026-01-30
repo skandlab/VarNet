@@ -614,11 +614,9 @@ def get_reads(bamfile, chrX, start, end):
 
     usable_reads = []
     reads = fetch_reads_from_bam(bamfile, chrX, start, end) # fetch returns an iterator, which you can go through only once so convert to list()
-    names_of_stacked_reads = {}
 
     for read in reads:
-        if is_usable_read(read) and read.query_name not in names_of_stacked_reads:
-            names_of_stacked_reads[read.query_name] = True
+        if is_usable_read(read):
             usable_reads.append(read)
 
     return usable_reads
@@ -1160,25 +1158,26 @@ def create_tumor_only_input_tensor_for_position(chromosome, position, bamfile_t,
     image_t = np.expand_dims(image_t, axis=0) # (W,H) -> (1,W,H)
     return image_t
 
-def create_input_tensor_for_position(chromosome, position, bamfile_n, bamfile_t, ref_file, mutate=None):
+def create_input_tensor_for_position(chromosome, position, bamfile_n, bamfile_t, ref_file, mutate=None, normal_reads=None, tumor_reads=None):
     """
     Returns the input tensor for given position
     The shape of the output is (1, INPUT_SHAPE), as used during prediction by keras.
 
     """
     # get fetch positions
-    fetch_region_flank =  int((c.SEQ_LENGTH - 1) / 2)
-    fetch_region_start = position - fetch_region_flank
-    fetch_region_end = position + fetch_region_flank + 1
+    fetch_region_start = position - c.FLANK
+    fetch_region_end = position + c.FLANK + 1
     
     # fetch normal and tumor reads
     if bamfile_n:
-        normal_reads = get_reads(bamfile_n, chromosome, fetch_region_start, fetch_region_end)
+        if normal_reads is None:
+            normal_reads = get_reads(bamfile_n, chromosome, fetch_region_start, fetch_region_end)
     else:
         # tumor-only mode
         normal_reads = []
 
-    tumor_reads = get_reads(bamfile_t, chromosome, fetch_region_start, fetch_region_end)
+    if tumor_reads is None:
+        tumor_reads = get_reads(bamfile_t, chromosome, fetch_region_start, fetch_region_end)
 
     # how many times to sample c.NUM_READS reads from bams
     n_read_samples = 1 

@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 Alternatively, you can use the docker image with all requirements installed (details below).
 
-**System Requirements:** Each process will use ~6GB of memory while running filter.py, and ~10GB while running predict.py. Please modify the --processes argument according to your memory and CPU availability. Whole genome filtering may take up 10-12 hours of **CPU** time, and whole genome prediction may take up to 150 hours of **CPU** time.
+**System Requirements:** Each process will use ~6GB of memory while running filter.py, and ~10GB while running predict.py. Please modify the --processes and --batch_size arguments according to your memory and CPU availability.
 
 ## Docker Image
 You can download the docker image from docker hub using the following command:
@@ -87,6 +87,7 @@ python predict.py \
 	--processes 2 \
 	--output_dir varnet_outputs \
 	--reference GRCh38.fa \
+	--batch_size 64 (optional, default 64)
 	-snv (optional flag, for snv calling only)
 	-indel (optional flag, for indel calling only)
 ```
@@ -101,7 +102,9 @@ To run VarNet-T, simply omit the `--normal_bam` argument to run the analysis on 
 
 This function must be run using the provided latest docker image above. Germline filtering using gnomAD and dbSNP databases (included in our docker image) will be automatically performed, in addition to a panel of normals filter. 
 
-In tumor-only mode, filter.py supports an optional **--whitelist\_vcf** argument that can be used to include any known germline oncogenic variants that may otherwise be filtered due to their presence in gnomAD or dbSNP. 
+📝 **Note: Tumor-only mode currently only supports the hg38 reference genome, as the gnomAD, dbSNP, and panel of normals filters are based on hg38.**
+
+In tumor-only mode, filter.py supports an optional **--whitelist\_vcf** argument that can be used to include any known germline oncogenic variants that may otherwise be filtered due to their presence in gnomAD or dbSNP.
 
 ## VarNet Benchmarking Guidance
 We recommend including all variant calls from VarNet's VCF output, not just those marked "PASS," when creating precision-recall curves. The "PASS" designation was determined by a score threshold of 0.5, but using all calls provides a more complete picture of the model's performance across all possible thresholds.

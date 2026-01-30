@@ -17,6 +17,7 @@ from joblib import Parallel, delayed
 # sys.path.append(repo_base)
 
 from snvs.generate_training_data import is_usable_read, get_reads
+from snvs.predict import get_read_starts, subset_reads
 
 import indels.constants_filter as c
 
@@ -440,9 +441,6 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
                     # if there is a deletion, record it AND advance curr_index to the end of the deletion
                     position = read.reference_start + curr_index
                     
-                    #if position == start_pos: 
-                    #    print((seg, read.query_sequence[qual_index:qual_index+int(seg[:-1])], read.mapping_quality))              
-
                     if position not in POSITIONS_COVERAGE:
                         POSITIONS_COVERAGE[position] = 1
                     else:   
@@ -481,15 +479,19 @@ def record_indels_simple(bamfile, chrX, start_pos, end_pos):
             # READ COUNT
             recorded_indels[position] = count[0] + count[1]
 
-    return recorded_indels
+    return recorded_indels, reads
 
-def get_indels(chrom, ref_pos, bamfile, ref_file):
+def get_indels(chrom, ref_pos, bamfile, ref_file, reads=None):
     """
     ref_pos must be the 0-indexed pos of the site before start of indel. 
     """
     DEPTH, REFERENCE_ALLELE_COUNT, ALT_ALLELE_READ_COUNT = 0, 0, 0
 
-    reads = bamfile.fetch(chrom, ref_pos, ref_pos+1)
+    if reads is None:
+        # fetch reads
+        reads = get_reads(bamfile, chrom, ref_pos, ref_pos+1) # applies is_usable_read() filter
+        # reads = bamfile.fetch(chrom, ref_pos, ref_pos+1)
+
     indels = []
 
     # finds most frequent element in a list
@@ -592,12 +594,13 @@ def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, ref_file, r
         # not one base before indel starts
 
         if bamfile_n:
-            recorded_indels_n = record_indels_simple(bamfile_n, chrom, start, end)
+            recorded_indels_n, normal_reads = record_indels_simple(bamfile_n, chrom, start, end)
         else:
             # tumor-only mode
             recorded_indels_n = {}
 
-        recorded_indels_t = record_indels_simple(bamfile_t, chrom, start, end)
+        recorded_indels_t, tumor_reads = record_indels_simple(bamfile_t, chrom, start, end)
+        tumor_read_starts, tumor_max_read_len = get_read_starts(tumor_reads)
 
         # indels recorded in t should not be in n
         for p in list(recorded_indels_t.keys()):
@@ -614,7 +617,7 @@ def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, ref_file, r
             if p not in recorded_indels_n or abs(recorded_indels_t[p] - recorded_indels_n[p]) > margin:
                 # get INFO for candidate site
                 REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT, TUMOR_ALT_ALLELE_READ_COUNT, TUMOR_ALT_ALLELE_FRACTION \
-                = get_indels(chrom, p-1, bamfile_t, ref_file) # get_indels() needs 0-indexed pos of site before indel
+                = get_indels(chrom, p-1, bamfile_t, ref_file, reads=subset_reads(tumor_reads, tumor_read_starts, tumor_max_read_len, p-1, p)) # get_indels() needs 0-indexed pos of site before indel
 
                 if TUMOR_ALT_ALLELE_FRACTION < c.MIN_INDEL_ALLELE_FREQUENCY:
                     # apply AF filter here instead of VCF

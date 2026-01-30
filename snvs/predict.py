@@ -17,7 +17,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import snvs.constants as c
 
-from snvs.generate_training_data import get_reference, generate_image, populate_array, create_input_tensor_for_position, create_tumor_only_input_tensor_for_position, get_ref_base
+from snvs.generate_training_data import get_reference, generate_image, populate_array, create_input_tensor_for_position, create_tumor_only_input_tensor_for_position, get_ref_base, get_reads
 
 CURRENT_DIR = os.path.dirname(__file__) 
 
@@ -108,11 +108,38 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         y_pred_test = model(input_tensor, training=True)
         return y_pred_test
 
+def get_read_starts(reads):
+    read_starts = []
+    max_read_len = 0
+
+    for r in reads:
+        # 1. Collect the start position
+        start = r.reference_start
+        read_starts.append(start)
+        
+        # 2. Calculate length and update max if it's larger
+        length = r.reference_end - start
+        if length > max_read_len:
+            max_read_len = length
+    
+    return read_starts, max_read_len
+
+def subset_reads(reads, read_starts, max_read_len, fetch_start, fetch_end):
+    """
+    Using bisect to quickly subset reads as reads can otherwise be very large (millions of reads). 
+    This replicates what bamfile.fetch(chrom, fetch_start, fetch_end) would return. 
+    Note that the chrom is assumed to be the same for all reads, as they should be per batch in both filter and predict steps.
+    """
+    import bisect
+    idx_start = bisect.bisect_left(read_starts, fetch_start-max_read_len)
+    idx_end = bisect.bisect_right(read_starts, fetch_end)
+    return [r for r in reads[idx_start:idx_end] if r.reference_start < fetch_end and r.reference_end > fetch_start]
+
 def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
     print(("SNV PREDICTION BATCH:", batch_num))
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     if args.normal_bam:
         bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False) # normal bamfile
@@ -123,6 +150,19 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
     bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb", check_sq=False) # tumor bamfile
     ref_file = get_ref_file(args.reference)    
 
+    # fetch reads for all positions in this batch (they belong to same chromosome and within 10Mbp)
+    region_start, region_end = positions_to_predict['pos'].values[0] - c.FLANK, positions_to_predict['pos'].values[-1] + c.FLANK + 1
+    if args.normal_bam:
+        normal_reads = get_reads(bamfile_n, positions_to_predict['chrom'].values[0], region_start, region_end)
+        normal_read_starts, normal_max_read_len = get_read_starts(normal_reads)
+    else:
+        normal_reads = None 
+        normal_read_starts = []
+        normal_max_read_len = 0
+        
+    tumor_reads = get_reads(bamfile_t, positions_to_predict['chrom'].values[0], region_start, region_end)
+    tumor_read_starts, tumor_max_read_len = get_read_starts(tumor_reads)
+    
     columns = ['chrom', 'pos', 'REF', 'ALT', 'DP', 'RO', 'AO', 'AF', 'pred_true']
     results = pd.DataFrame(columns=columns)
     results['chrom'] = results['chrom'].astype(str)
@@ -211,8 +251,20 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
             if pos_key in positions_completed:
                 continue
 
+            fetch_start = pos - c.FLANK
+            fetch_end = pos + c.FLANK + 1
+
+            if normal_reads:
+                # filter normal
+                current_normal_reads = subset_reads(normal_reads, normal_read_starts, normal_max_read_len, fetch_start, fetch_end)
+            else:
+                current_normal_reads = None
+
+            # filter tumor
+            current_tumor_reads = subset_reads(tumor_reads, tumor_read_starts, tumor_max_read_len, fetch_start, fetch_end)
+
             if c.TEST_TIME_TRAINING:
-                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
                 test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
                 pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds, args=args)
                 pred_true = float(pred_true[0])
@@ -220,7 +272,7 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
                 results_dict = {'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true}
                 results = results.append(results_dict, ignore_index=True)
             else:
-                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file)
+                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
                 batch_input_tensors.append(input_tensor)
                 batch_metadata.append(row)
 
