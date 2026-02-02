@@ -23,14 +23,14 @@ from snvs.predict import predict_snvs
 from indels.filter import get_indels
 from indels.predict import predict_indels
 
-def split_candidates_into_batches(candidates):
+def split_candidates_into_batches(candidates, max_dist=1000000):
     """
     Group candidates such that each batch belongs to the same chromosome
-    and the difference between the earliest and latest position is no more than 1Mbp.
+    and the difference between the earliest and latest position is no more than max_dist (default: 1Mbp).
     
     Args:
         candidates: DataFrame with 'chrom' and 'pos' columns
-        
+        max_dist: Maximum distance between the earliest and latest position in a batch (default: 1Mbp)
     Returns:
         List of DataFrame batches (empty batches removed)
     """
@@ -48,7 +48,7 @@ def split_candidates_into_batches(candidates):
         curr_chrom = cand_chroms[i]
         curr_pos = cand_pos[i]
 
-        if curr_chrom != batch_chrom or (curr_pos - batch_start_pos) > 1000000:
+        if curr_chrom != batch_chrom or (curr_pos - batch_start_pos) > max_dist:
             split_indices.append(i)
             batch_chrom = curr_chrom
             batch_start_pos = curr_pos
@@ -540,7 +540,8 @@ def main(adapted=False):
 
             print(("Number of INDEL candidates: ", len(indel_candidates)))
 
-            indel_candidate_batches = split_candidates_into_batches(indel_candidates)
+            # indel model and input tensor is larger so reduce max_dist to 250kbp
+            indel_candidate_batches = split_candidates_into_batches(indel_candidates, max_dist=250000)
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder, adapted=adapted) for idx, batch in enumerate(indel_candidate_batches) )
