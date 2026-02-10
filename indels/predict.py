@@ -165,9 +165,6 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
                 pos_key = 'chrom%spos%s' % (chrom, pos)
                 positions_completed[pos_key] = True
 
-    # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
-    # os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
     if args.normal_bam:
         bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb") # normal bamfile
     else:
@@ -258,7 +255,7 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
             start_pos_exact = get_start(pos)
             end_pos_exact = get_end(pos)
 
-            if normal_reads:
+            if normal_reads is not None:
                 # filter normal
                 current_normal_reads = subset_reads(normal_reads, normal_read_starts, normal_max_read_len, start_pos_exact, end_pos_exact)
             else:

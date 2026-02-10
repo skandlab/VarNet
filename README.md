@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 Alternatively, you can use the docker image with all requirements installed (details below).
 
-**System Requirements:** Each process will use ~6GB of memory while running filter.py, and ~10GB while running predict.py. Please modify the --processes and --batch_size arguments according to your memory and CPU availability.
+**System Requirements:** Each process will use ~6GB of memory while running filter.py, and ~10GB while running predict.py. Please modify the --processes arguments according to your memory and CPU availability.
 
 ## Docker Image
 You can download the docker image from docker hub using the following command:
@@ -73,12 +73,12 @@ python filter.py \
     --processes 2 \
     --output_dir varnet_outputs \
     --reference GRCh38.fa \
-    --region_bed region.bed (optional)
-    --whitelist_vcf whitelist.vcf (optional, use only in tumor-only mode)
-    -snv (optional flag, for snv filtering only)
+    --region_bed region.bed (optional) \
+    --whitelist_vcf whitelist.vcf (optional, use only in tumor-only mode) \
+    -snv (optional flag, for snv filtering only) \
     -indel (optional flag, for indel filtering only)
 ```
-2. Make predictions and create VCF output (CPU mode)
+2. Make predictions and create VCF output
 ```
 python predict.py \
 	--sample_name dream1 \
@@ -87,8 +87,8 @@ python predict.py \
 	--processes 2 \
 	--output_dir varnet_outputs \
 	--reference GRCh38.fa \
-	--batch_size 64 (optional, default 64)
-	-snv (optional flag, for snv calling only)
+	--batch_size 64 (optional, default 64) \
+	-snv (optional flag, for snv calling only) \
 	-indel (optional flag, for indel calling only)
 ```
 

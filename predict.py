@@ -23,14 +23,98 @@ from snvs.predict import predict_snvs
 from indels.filter import get_indels
 from indels.predict import predict_indels
 
+def get_coverage(bamfile, chrom, ref_pos):
+    coverage = bamfile.count_coverage(chrom, ref_pos, ref_pos+1)#, quality_threshold=c.MIN_BASE_QUALITY, read_callback=check_read)
+
+    # [ (#A, #C, #G, #T) ] at each position in tumor
+    coverage_list = [(coverage[0][i], coverage[1][i], coverage[2][i], coverage[3][i])
+        for i in range(len(coverage[0]))]
+
+    assert len(coverage_list) == 1
+    coverage_list = coverage_list[0] # A C G T
+    coverage_list = list(coverage_list) # convert tuple to list
+    return coverage_list
+
+def germline_filter(chrom, ref_pos, bamfile_n, ref_file):
+    # return True if germline variant (snp or indel) found in the neighboring region
+    # search to the left of the site (and 1bp to the right), in order to check if there is an indel that overlaps the somatic site but begins in a prior position
+    margin = 0 # previously 1. reject a somatic site if there is a germline variant within this margin
+    window = 1 # previously 10
+
+    start, end = ref_pos + margin, ref_pos-window
+    if end<0: end = 0 # sanity check
+
+    check_sites = range(start, end, -1) # [ref_pos + 1, ref_pos, ref_pos-1, ref_pos-2, ..., ref_pos-49]
+
+    # filter site if there exists a germline variant with AF > 0.1 AND it overlaps with the somatic site of interest
+    for site in check_sites:
+        snp=get_snv(get_coverage(bamfile_n, chrom, site), get_ref_base(site, chrom, ref_file))
+        indel=get_indels(chrom, site, bamfile_n, ref_file)
+
+        snp_AF, indel_AF = snp[-1], indel[-1]
+        max_AF = max([snp_AF, indel_AF])
+
+        GERMLINE_FILTER = 0.1
+
+        if max_AF > GERMLINE_FILTER:
+            # active germline variant, now check if it overlaps the somatic site
+            if abs(site-ref_pos) <= margin:
+                return True # site is close or equal to ref_pos
+
+            # if it is an indel on the left of ref_pos, check if it overlaps the somatic site (ref_pos)
+            elif site<ref_pos and indel_AF>=snp_AF:
+                indel_length = abs(len(indel[0])-len(indel[1])) # length of insertion or deletion. diff between ref and alt sequence lengths
+                right_end = site + indel_length # right end of indel
+
+                # if the indel overlaps the somatic site within margin, reject somatic site
+                if (right_end + margin >= ref_pos): 
+                    return True
+
+        else:
+            # no active germline variant (AF>0.1) at this site, move on to next site
+            continue
+
+    return False
+
+def parse_predictions_batch(batch, args, mode):    
+    results = []
+    ref_file = pysam.FastaFile(args.reference)
+
+    bamfile_n = None
+    if args.normal_bam and not args.ffpe:
+        bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False)
+
+    for _, row in batch.iterrows():
+        # row: [CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true]
+        CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true = \
+            row[0], int(row[1]), row[2], row[3], int(row[4]), int(row[5]), int(row[6]), float(row[7]), float(row[8])
+
+        if c.GERMLINE_FILTER and bamfile_n and germline_filter(CHROM, POS, bamfile_n, ref_file):
+            continue
+        
+        ALT_ALLELE_FRACTION_IN_TUMOR = round(ALT_ALLELE_FRACTION_IN_TUMOR, 3)
+        POSITION_1_INDEXED = POS + 1
+        FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
+        INFO = 'TYPE=%s;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % (mode, str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
+        FORMAT = 'GT:DP:RO:AO:AF'
+        SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
+
+        OUT = (CHROM, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
+        results.append('\t'.join(map(str, OUT)) + '\n')
+
+    if bamfile_n:
+        bamfile_n.close()
+    ref_file.close()
+    return results
+
 def split_candidates_into_batches(candidates, max_dist=1000000):
     """
     Group candidates such that each batch belongs to the same chromosome
-    and the difference between the earliest and latest position is no more than max_dist (default: 1Mbp).
+    and the difference between the earliest and latest position is no more than max_dist (default: 2Mbp).
     
     Args:
         candidates: DataFrame with 'chrom' and 'pos' columns
-        max_dist: Maximum distance between the earliest and latest position in a batch (default: 1Mbp)
+        max_dist: Maximum distance between the earliest and latest position in a batch (default: 2Mbp)
     Returns:
         List of DataFrame batches (empty batches removed)
     """
@@ -90,8 +174,8 @@ def concatenate_batch_prediction_results(predictions_folder):
 def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=False):
     from datetime import datetime
 
-    ref_file = get_ref_file(args.reference)
-    
+    # reference file handle is now opened within parallel parsing workers
+
     output_vcf = os.path.join(sample_folder, args.sample_name + f'{".adapted" if adapted else ""}.vcf.gz')
 
     if os.path.exists(output_vcf):
@@ -145,182 +229,27 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
         CUT_OFF = args.threshold
         print('>>> VCF minimum score threshold:', CUT_OFF)
 
-    if args.normal_bam and not args.ffpe:
-        # don't use normal sample for ffpe (no need as initial variant calling should have removed germline filters, if normal bam available)
-        bamfile_n = pysam.AlignmentFile(args.normal_bam, "rb", check_sq=False)
-    else:
-        # tumor-only mode
-        bamfile_n = None
-
-    bamfile_t = pysam.AlignmentFile(args.tumor_bam, "rb", check_sq=False)
-
-    def get_coverage(bamfile, chrom, ref_pos):
-        coverage = bamfile.count_coverage(chrom, ref_pos, ref_pos+1)#, quality_threshold=c.MIN_BASE_QUALITY, read_callback=check_read)
-
-        # [ (#A, #C, #G, #T) ] at each position in tumor
-        coverage_list = [(coverage[0][i], coverage[1][i], coverage[2][i], coverage[3][i])
-            for i in range(len(coverage[0]))]
-
-        assert len(coverage_list) == 1
-        coverage_list = coverage_list[0] # A C G T
-        coverage_list = list(coverage_list) # convert tuple to list
-        return coverage_list
-
-    def germline_filter(chrom, ref_pos, bamfile_n, ref_file):
-        # return True if germline variant (snp or indel) found in the neighboring region
-        # search to the left of the site (and 1bp to the right), in order to check if there is an indel that overlaps the somatic site but begins in a prior position
-        margin = 0 # previously 1. reject a somatic site if there is a germline variant within this margin
-        window = 1 # previously 10
-
-        start, end = ref_pos + margin, ref_pos-window
-        if end<0: end = 0 # sanity check
-
-        check_sites = range(start, end, -1) # [ref_pos + 1, ref_pos, ref_pos-1, ref_pos-2, ..., ref_pos-49]
-
-        # filter site if there exists a germline variant with AF > 0.1 AND it overlaps with the somatic site of interest
-        for site in check_sites:
-            snp=get_snv(get_coverage(bamfile_n, chrom, site), get_ref_base(site, chrom, ref_file))
-            indel=get_indels(chrom, site, bamfile_n, ref_file)
-
-            snp_AF, indel_AF = snp[-1], indel[-1]
-            max_AF = max([snp_AF, indel_AF])
-
-            GERMLINE_FILTER = 0.1
-
-            if max_AF > GERMLINE_FILTER:
-                # active germline variant, now check if it overlaps the somatic site
-                if abs(site-ref_pos) <= margin:
-                    return True # site is close or equal to ref_pos
-
-                # if it is an indel on the left of ref_pos, check if it overlaps the somatic site (ref_pos)
-                elif site<ref_pos and indel_AF>=snp_AF:
-                    indel_length = abs(len(indel[0])-len(indel[1])) # length of insertion or deletion. diff between ref and alt sequence lengths
-                    right_end = site + indel_length # right end of indel
-
-                    # if the indel overlaps the somatic site within margin, reject somatic site
-                    if (right_end + margin >= ref_pos): 
-                        return True
-
-            else:
-                # no active germline variant (AF>0.1) at this site, move on to next site
-                continue
-
-        return False
-
-    def parse_indel_predictions(f):
-        with open(f) as r:
-            for line in r:
-                line = line.strip()
-                s=line.split('\t')
-                CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true = \
-                s[0], int(s[1]), s[2], s[3], int(s[4]), int(s[5]), int(s[6]), float(s[7]), float(s[8])
-
-                if pred_true < CUT_OFF:
-                    continue
-
-                # if not args.ffpe and not args.normal_bam:
-                #     # tumor-only not ffpe
-                #     pred_true = adjust_pred_true(pred_true, ALT_ALLELE_FRACTION_IN_TUMOR)
-
-                FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
-
-                if c.GERMLINE_FILTER and bamfile_n and germline_filter(CHROM, POS, bamfile_n, ref_file):
-                    continue # overlapping germline variant identified
-
-                POSITION_1_INDEXED = POS + 1
-
-                INFO = 'TYPE=INDEL;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % \
-                (str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
-
-                FORMAT = 'GT:DP:RO:AO:AF'
-
-                SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
-
-                OUT = (CHROM, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
-
-                out_string = ''
-                for i in OUT:
-                    out_string += str(i) + '\t'
-                out_string += '\n'
-
-                vcf_write.write(out_string)
-
-    def adjust_score(pred_true, training_prior_somatic_class):
-        # training_prior_somatic_class is the prior class probability of somatic mutation in training set
-        # pred_true is the model's predicted score for somatic mutation
-        adjusted_somatic_score = pred_true * 0.5/training_prior_somatic_class
-        adjusted_non_somatic_score = (1-pred_true) * (1-0.5)/(1-training_prior_somatic_class)
-        normalized_somatic_score = adjusted_somatic_score/(adjusted_somatic_score+adjusted_non_somatic_score)
-        return normalized_somatic_score
-
-    def adjust_pred_true(pred_true, VAF):
-        training_prior_somatic_class = 0.5
-        if False:
-            pass
-        # elif VAF <= 0.1:
-        #     training_prior_somatic_class = 0.1
-        # elif VAF > 0.1 and VAF <= 0.2:
-        #     training_prior_somatic_class = 0.43
-        # elif VAF > 0.2 and VAF <= 0.3:
-        #     training_prior_somatic_class = 0.66
-        # elif VAF > 0.3 and VAF <= 0.4:
-        #     training_prior_somatic_class = 0.74
-        # elif VAF > 0.4 and VAF <= 0.5:
-        #     training_prior_somatic_class = 0.61
-        # elif VAF > 0.5 and VAF <= 0.6:
-        #     training_prior_somatic_class = 0.46
-        # elif VAF > 0.6 and VAF <= 0.7:
-        #     training_prior_somatic_class = 0.48
-        # elif VAF > 0.7 and VAF <= 0.8:
-        #     training_prior_somatic_class = 0.57
-        # elif VAF > 0.8 and VAF <= 0.9:
-        #     training_prior_somatic_class = 0.56
-        elif VAF > 0.9:
-            training_prior_somatic_class = 0.04
-
-        return adjust_score(pred_true, training_prior_somatic_class)
-
-
-    def parse_snv_predictions(f):
-        with open(f) as r:
-            for line in r:
-                line = line.strip()
-                s=line.split('\t')
-
-                CHROM, POS, REFERENCE_ALLELE, ALT_ALLELE, TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, ALT_ALLELE_FRACTION_IN_TUMOR, pred_true \
-                = s[0], int(s[1]), s[2], s[3], int(s[4]), int(s[5]), int(s[6]), float(s[7]), float(s[8])
-
-                if pred_true < CUT_OFF:
-                    continue
-
-                # if not args.ffpe and not args.normal_bam:
-                #     # tumor-only not ffpe
-                #     # adjust the SCORE based on VAF
-                #     pred_true = adjust_pred_true(pred_true, ALT_ALLELE_FRACTION_IN_TUMOR)
-
-                if c.GERMLINE_FILTER and bamfile_n and germline_filter(CHROM, POS, bamfile_n, ref_file):
-                    continue # overlapping germline variant identified
-
-                POSITION_1_INDEXED = POS + 1
-                FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
-                INFO = 'TYPE=SNV;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % (str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
-                FORMAT = 'GT:DP:RO:AO:AF'
-                SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
-
-                OUT = (CHROM, POSITION_1_INDEXED, '.', REFERENCE_ALLELE, ALT_ALLELE, '.', FILTER, INFO, FORMAT, SAMPLE)
-
-                out_string = ''
-                for i in OUT:
-                    out_string += str(i) + '\t'
-                out_string += '\n'
-
-                vcf_write.write(out_string)
+    # BAM handles are now opened within parallel parsing workers
 
     if not args.indel: # if not indel only
-        parse_snv_predictions(snv_predictions_file)
+        snv_df = pd.read_csv(snv_predictions_file, sep='\t', header=None)
+        snv_df = snv_df[snv_df[8] >= CUT_OFF]
+        if len(snv_df) > 0:
+            batches = np.array_split(snv_df, min(len(snv_df), args.processes * 4))
+            results = Parallel(n_jobs=args.processes)(delayed(parse_predictions_batch)(batch, args, 'SNV') for batch in batches)
+            for res_list in results:
+                for line in res_list:
+                    vcf_write.write(line)
 
     if not args.snv: # if not snv only
-        parse_indel_predictions(indel_predictions_file)
+        indel_df = pd.read_csv(indel_predictions_file, sep='\t', header=None)
+        indel_df = indel_df[indel_df[8] >= CUT_OFF]
+        if len(indel_df) > 0:
+            batches = np.array_split(indel_df, min(len(indel_df), args.processes * 4))
+            results = Parallel(n_jobs=args.processes)(delayed(parse_predictions_batch)(batch, args, 'INDEL') for batch in batches)
+            for res_list in results:
+                for line in res_list:
+                    vcf_write.write(line)
 
     vcf_write.close()
     
@@ -539,7 +468,7 @@ def main(adapted=False):
             indel_candidates = indel_candidates.sort_values(['chrom', 'pos'], ascending=[True, True]).reset_index(drop=True)
 
             print(("Number of INDEL candidates: ", len(indel_candidates)))
-
+            
             # indel model and input tensor is larger so reduce max_dist to 250kbp
             indel_candidate_batches = split_candidates_into_batches(indel_candidates, max_dist=250000)
 

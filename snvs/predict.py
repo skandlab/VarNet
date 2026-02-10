@@ -254,7 +254,7 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
             fetch_start = pos - c.FLANK
             fetch_end = pos + c.FLANK + 1
 
-            if normal_reads:
+            if normal_reads is not None:
                 # filter normal
                 current_normal_reads = subset_reads(normal_reads, normal_read_starts, normal_max_read_len, fetch_start, fetch_end)
             else:
