@@ -111,13 +111,10 @@ We recommend including all variant calls from VarNet's VCF output, not just thos
 
 # License
 
-Shield: [![CC BY-NC-SA 4.0][cc-by-nc-sa-shield]][cc-by-nc-sa]
+Shield: [![License: PolyForm NC 1.0.0](https://img.shields.io/badge/License-PolyForm%20NC%201.0.0-blue.svg)][polyform-nc]
 
-This work is licensed under a
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
+This work is licensed under the [PolyForm Noncommercial License 1.0.0][polyform-nc].
 
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
+[![PolyForm License Image](https://img.shields.io/badge/View%20License-PolyForm%20Project-lightgrey)][polyform-nc]
 
-[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
-[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
-[cc-by-nc-sa-shield]: https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg
+[polyform-nc]: https://polyformproject.org/licenses/noncommercial/1.0.0/
