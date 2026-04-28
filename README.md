@@ -4,16 +4,37 @@ VarNet is a pre-trained deep learning model trained on vast amounts of next gene
 
 ![VarNet summary](varnet.png)
 
-## Publication
+## Publications
+
 If you use VarNet in your work, please cite this paper:
 
-Krishnamachari, K., Lu, D., Swift-Scott, A. et al. Accurate somatic variant detection using weakly supervised deep learning. Nat Commun 13, 4248 (2022). https://doi.org/10.1038/s41467-022-31765-8
+> Krishnamachari, K., Lu, D., Swift-Scott, A. et al. Accurate somatic variant detection using weakly supervised deep learning. *Nat Commun* **13**, 4248 (2022). https://doi.org/10.1038/s41467-022-31765-8
 
-<!-- ## Table of Contents
-**[Requirements](#requirements)**<br/>
-**[Docker Image](#docker-image)**<br/>
-**[Example Usage](#example-usage)**<br/>
- -->
+```bibtex
+@article{krishnamachari2022varnet,
+  author  = {Krishnamachari, K. and Lu, D. and Swift-Scott, A. et al.},
+  title   = {Accurate somatic variant detection using weakly supervised deep learning},
+  journal = {Nature Communications},
+  volume  = {13},
+  pages   = {4248},
+  year    = {2022},
+  doi     = {10.1038/s41467-022-31765-8}
+}
+```
+
+Please also cite the VarNet-T paper if you use the tumor-only model:
+
+> Krishnamachari, K., Bui Nguyen, H.A., Kadioglu, S. et al. Improved tumor-only variant calling and mutation burden estimation with VarNet-T. *Nat Commun* (2026). https://doi.org/10.1038/s41467-026-71705-4
+
+```bibtex
+@article{krishnamachari2026varnett,
+  author  = {Krishnamachari, K. and {Bui Nguyen}, H.A. and Kadioglu, S. et al.},
+  title   = {Improved tumor-only variant calling and mutation burden estimation with {VarNet-T}},
+  journal = {Nature Communications},
+  year    = {2026},
+  doi     = {10.1038/s41467-026-71705-4}
+}
+```
 
 ## Requirements
 VarNet has been tested with python3.7, it may run without issues on other versions of python3. After downloading the latest release [here](https://github.com/skandlab/VarNet/releases), you can install the required libraries using the following command in the root of the repo:
