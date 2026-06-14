@@ -7,6 +7,8 @@ import snvs.constants as c
 import os
 import argparse
 import sys
+import gc
+import ctypes
 
 from utils import load_npz
 from snvs.filter import filter_snvs, ffpe_filter_snvs
@@ -307,19 +309,22 @@ def filter_candidates(args, snv_candidates_folder, indel_candidates_folder, bamn
     # need to re-define the ref_file here since it cannot be pickled by joblib in Parallel() call
     ref_file = pysam.FastaFile(args.reference)
 
-    if not args.indel: # if not indel_only
-        if os.path.exists(snv_candidates_file):
-            pass#print(("SNV candidates already generated. Delete this folder to re-generate candidates:", snv_candidates_folder))
-        else:
-            filter_snvs(snv_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
+    try:
+        if not args.indel: # if not indel_only
+            if os.path.exists(snv_candidates_file):
+                pass#print(("SNV candidates already generated. Delete this folder to re-generate candidates:", snv_candidates_folder))
+            else:
+                filter_snvs(snv_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
 
-    indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
+        indel_candidates_file = os.path.join(indel_candidates_folder, c.filtered_positions_file)
 
-    if not args.snv: # if not snv_only
-        if os.path.exists(indel_candidates_file):
-            pass#print(("INDEL candidates already generated. Delete this folder to re-generate candidates:", indel_candidates_folder))
-        else:
-            output = filter_indels(indel_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
+        if not args.snv: # if not snv_only
+            if os.path.exists(indel_candidates_file):
+                pass#print(("INDEL candidates already generated. Delete this folder to re-generate candidates:", indel_candidates_folder))
+            else:
+                output = filter_indels(indel_candidates_folder, bamname_n, bamname_t, ref_file, regions, batch_num)
+    finally:
+        ref_file.close()
         
 def main(sample_name, bamname_n, bamname_t, args, goldset=True):
 
@@ -366,8 +371,16 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
         print("Reading bed file:", args.region_bed)
         batches = parse_bed(args.region_bed)
 
+    # close the reference handle used for chromosome enumeration
+    # (each filter_candidates worker opens its own handle)
+    ref_file.close()
+
 
     Parallel(n_jobs=args.processes)(delayed(filter_candidates)(args, snv_candidates_folder, indel_candidates_folder, bamname_n, bamname_t, batches[i], i) for i in range(len(batches)))
+    
+    gc.collect()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
     
     if not args.indel: concat_csv_files(snv_candidates_folder)
     if not args.snv: concat_csv_files(indel_candidates_folder)

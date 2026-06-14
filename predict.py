@@ -7,6 +7,7 @@ import joblib
 from joblib import Parallel, delayed, __version__
 import os
 import sys
+import gc
 import gzip
 
 # Disable tf logging. 1 to filter out INFO logs, 2 to additionally filter out WARNING logs,
@@ -440,10 +441,11 @@ def main(adapted=False):
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder, adapted=adapted) for idx, batch in enumerate(snv_candidate_batches) )
-            except joblib.my_exceptions.WorkerInterrupt as e:
+            except KeyboardInterrupt as e:
                 print(('workerinterrupt', e))
 
             concatenate_batch_prediction_results(snv_predictions_folder)
+            gc.collect()
 
     if not args.snv: # do indels
         indel_predictions_folder = os.path.join(predictions_folder, c.indel_candidates_folder)
@@ -474,10 +476,11 @@ def main(adapted=False):
 
             try:
                 Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder, adapted=adapted) for idx, batch in enumerate(indel_candidate_batches) )
-            except joblib.my_exceptions.WorkerInterrupt as e:
+            except KeyboardInterrupt as e:
                 print(('workerinterrupt', e))
 
             concatenate_batch_prediction_results(indel_predictions_folder)
+            gc.collect()
 
     if args.ffpe:
         # filter args.vcf

@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import gc
+import ctypes
 import pysam
 import argparse
 import numpy as np
@@ -494,9 +496,24 @@ def get_indels(chrom, ref_pos, bamfile, ref_file, reads=None):
 
     indels = []
 
-    # finds most frequent element in a list
+    # finds most frequent element in a list with deterministic tie-breaking.
+    # When counts are equal, the element that appears FIRST in the list wins.
+    # This replaces max(set(List), key=List.count) which is non-deterministic
+    # because set iteration order is arbitrary (Python hash randomization).
     def most_frequent(List):
-        return max(set(List), key = List.count)
+        if not List:
+            return None
+        counts = {}
+        first_seen = {}
+        for idx, item in enumerate(List):
+            if item not in counts:
+                counts[item] = 0
+                first_seen[item] = idx
+            counts[item] += 1
+        max_count = max(counts.values())
+        # among tied elements, return the one appearing first in the original list
+        tied = [item for item in counts if counts[item] == max_count]
+        return min(tied, key=lambda item: first_seen[item])
 
     for read in reads: # extract the insertion/deletion in read at ref_pos
         DEPTH += 1
@@ -630,6 +647,15 @@ def filter_indels(candidates_folder, bamfile_n_path, bamfile_t_path, ref_file, r
             f.write('%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' % (pos[0], pos[1]-1, pos[2], pos[3], pos[4], pos[5], pos[6], pos[7])) # 0-indexed position of the base before indel starts
 
     print(("COMPLETED INDEL BATCH", output_file))
+
+    # Release BAM handles to prevent file-handle exhaustion
+    if bamfile_n:
+        bamfile_n.close()
+    bamfile_t.close()
+    gc.collect()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+
 
 def divide_chromosomes_into_batches(superbatch, num_threads):
     """

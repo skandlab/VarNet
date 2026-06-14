@@ -3,6 +3,7 @@ import operator
 import numpy as np
 from time import time, sleep
 import gc
+import ctypes
 import os
 
 import snvs.constants as c
@@ -457,4 +458,13 @@ def filter_snvs(candidates_folder, bamname_n, bamname_t, ref_file, regions, batc
         for pos in candidates:
             f.write('%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' % (pos[0], pos[1], pos[2], pos[3], pos[4], pos[5], pos[6], pos[7]))
 
-    print(('COMPLETED SNV BATCH: ', output_file)) 
+    print(('COMPLETED SNV BATCH: ', output_file))
+
+    # Release BAM handles to prevent file-handle exhaustion
+    if bamfile_n:
+        bamfile_n.close()
+    bamfile_t.close()
+    gc.collect()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+
