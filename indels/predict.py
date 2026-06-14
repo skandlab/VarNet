@@ -230,8 +230,6 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
             # channel_means, channel_stds = None, None
             # </ set to None for transformer, no need normalization>
 
-        if args.update_batch_norm:
-
         if getattr(args, 'update_batch_norm', False):
             update_batch_norm_fn(model, positions, bamfile_n, bamfile_t, channel_means, channel_stds, ref_file=ref_file, create_input_fn=create_input_tensor_for_position, predict_fn=predict_position)
 
