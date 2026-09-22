@@ -47,6 +47,30 @@ Alternatively, you can use the docker image with all requirements installed (det
 
 **System Requirements:** Each process will use ~6GB of memory while running filter.py, and ~10GB while running predict.py. Please modify the --processes arguments according to your memory and CPU availability.
 
+## Installation via Bioconda
+
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/varnet/README.html)
+
+VarNet is available on [Bioconda](https://bioconda.github.io/recipes/varnet/README.html):
+
+```
+conda create -n varnet -c conda-forge -c bioconda varnet
+conda activate varnet
+```
+
+This installs two commands, `varnet-filter` and `varnet-predict`, which take the same
+arguments as `filter.py` and `predict.py` in the usage examples below. For example:
+
+```
+varnet-filter  --sample_name dream1 --normal_bam dream1_normal.bam --tumor_bam dream1_tumor.bam \
+               --reference GRCh38.fa --output_dir varnet_outputs --processes 2
+varnet-predict --sample_name dream1 --normal_bam dream1_normal.bam --tumor_bam dream1_tumor.bam \
+               --reference GRCh38.fa --output_dir varnet_outputs --processes 2
+```
+
+Note: tumor-only mode requires the Docker image, which bundles the germline filtering
+databases. The Bioconda package supports tumor-normal mode.
+
 ## Docker Image
 You can download the docker image from docker hub using the following command:
 
