@@ -162,4 +162,6 @@ This work is licensed under the [PolyForm Noncommercial License 1.0.0][polyform-
 
 [![PolyForm License Image](https://img.shields.io/badge/View%20License-PolyForm%20Project-lightgrey)][polyform-nc]
 
+For a commercial license, please contact [skanderupamj@a-star.edu.sg](mailto:skanderupamj@a-star.edu.sg).
+
 [polyform-nc]: https://polyformproject.org/licenses/noncommercial/1.0.0/
