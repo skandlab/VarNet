@@ -194,6 +194,19 @@ def pon_filtering(path_to_candidates, pon):
     print('PoN filtered variants count:', filtered_candidates_count)
     print('Saved PoN filtered variant candidates:', path_to_candidates)
 
+# germline filtering resources for tumor-only mode, found in --resource_dir
+DBSNP_FILES = {'grch37': 'GrCh37-dbSNP-common-variants-0-indexed.npz', 'grch38': 'GrCh38-dbSNP-build-156-common-variants-0-indexed-CHROMPOS.npz'}
+GNOMAD_FILE = 'combined_gnomAD_v4.1_genomes_exomes_dict.hg38.chunks.npz'
+
+def resource_path(args, filename):
+    """
+    path to a germline filtering resource file in --resource_dir (tumor-only mode)
+    """
+    path = os.path.join(args.resource_dir, filename)
+    if not os.path.exists(path):
+        sys.exit(f'Resource file not found: {path}\nTumor-only mode needs the germline filtering resources. Download them into one folder and pass it with --resource_dir.')
+    return path
+
 def load_npz_part_single(filename, part_name):
     """Loads a specific part from the single NPZ file."""
     data = np.load(filename, allow_pickle=True)
@@ -402,10 +415,10 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
         # tumor-only mode, fetch dbSNP variant sites
         if args.reference_build == 'grch37':
             # Note: Grch37 currently not supported. To support GRch37, need to map chromosome names from the fasta file version (e.g. 1, 2, 3, GL000231.1, MT) to (chr1, chr2, chrUn_gl000231, chrM) to match what the dbSNP dictionary is using
-            dbSNP_variants_0_indexed = load_npz('GrCh37-dbSNP-common-variants-0-indexed.npz') # build 155
+            dbSNP_variants_0_indexed = load_npz(resource_path(args, DBSNP_FILES['grch37'])) # build 155
         elif args.reference_build == 'grch38':
             # dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-common-variants-0-indexed.npz') # build 155, {CHROM}pos{POS}
-            dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-build-156-common-variants-0-indexed-CHROMPOS.npz') # build 156, CHROM{CHROM}POS{POS}
+            dbSNP_variants_0_indexed = load_npz(resource_path(args, DBSNP_FILES['grch38'])) # build 156, CHROM{CHROM}POS{POS}
             # dbSNP_variants_0_indexed = load_npz('GrCh38-dbSNP-build-156-common-variants-0-indexed.npz') # build 156, CHROM{CHROM}POS{POS}REF{REF}ALT{ALT}
         else:
             raise Exception('unrecognized reference build:', args.reference_build)
@@ -426,7 +439,7 @@ def main(sample_name, bamname_n, bamname_t, args, goldset=True):
         # load gnomAD in chunks to lower memory need
         filtered_candidates_count = 0
         for part in list(range(1,21)): # [1,...,20]
-            gnomAD_variants_1_indexed = load_npz_part_single("combined_gnomAD_v4.1_genomes_exomes_dict.hg38.chunks.npz", f"part_{part}") # CHROMPOSREFALT: True
+            gnomAD_variants_1_indexed = load_npz_part_single(resource_path(args, GNOMAD_FILE), f"part_{part}") # CHROMPOSREFALT: True
         
             if not args.indel: filtered_candidates_count += gnomAD_filtering(snv_candidates_file, gnomAD_variants_1_indexed, args.whitelist_vcf)
             if not args.snv: filtered_candidates_count += gnomAD_filtering(indel_candidates_file, gnomAD_variants_1_indexed, args.whitelist_vcf)
@@ -495,11 +508,17 @@ def parse_args():
     parser.add_argument('--gnomad_dbsnp', action='store_true', help='do germline filtering using gnomad and dbsnp')
     parser.add_argument('--no_gnomad_dbsnp', action='store_true', help='dont do germline filtering using gnomad and dbsnp')
     parser.add_argument('--whitelist_vcf', required=False, type=str, default=None, help='list of variants to whitelist during germline filtering using gnomAD/dbSNP (for tumor-only mode)')
+    parser.add_argument('--resource_dir', required=False, type=str, default='.', help='folder with the gnomAD and dbSNP germline filtering resources (for tumor-only mode, default: current folder)')
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
-    
+
+    if (not args.no_gnomad_dbsnp and not args.normal_bam) or args.gnomad_dbsnp:
+        # tumor-only: check the germline filtering resources exist before finding candidates
+        resource_path(args, DBSNP_FILES[args.reference_build])
+        resource_path(args, GNOMAD_FILE)
+
     # if not args.normal_bam:
     #     if not args.reference_build:
     #         print('Please provide --reference_build ("grch37", "grch38") argument in tumor-only mode')

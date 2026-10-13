@@ -14,7 +14,7 @@ import gzip
 # and 3 to additionally filter out ERROR logs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-from filter import create_folder
+from filter import create_folder, resource_path
 from utils import get_ref_file
 
 import snvs.constants as c
@@ -172,6 +172,8 @@ def concatenate_batch_prediction_results(predictions_folder):
     for f in batch_prediction_files:
        os.remove(f)
 
+PON_FILE = '1000g_pon.hg38.vcf.gz'
+
 def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=False):
     from datetime import datetime
 
@@ -269,7 +271,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
     if not args.normal_bam:
         # tumor-only, do PoN subtraction
         pon_vcf = final_vcf.replace('.vcf.gz', '.pon.vcf')
-        os.system(f'bedtools subtract -a {final_vcf} -b 1000g_pon.hg38.vcf.gz -header > {pon_vcf} && gzip {pon_vcf} && mv {pon_vcf}.gz {final_vcf}')
+        os.system(f'bedtools subtract -a {final_vcf} -b {resource_path(args, PON_FILE)} -header > {pon_vcf} && gzip {pon_vcf} && mv {pon_vcf}.gz {final_vcf}')
         print('>>> Panel of normal subtraction complete.')
 
     # sort vcf
@@ -596,12 +598,17 @@ def parse_args():
     parser.add_argument('--threshold', default=None, type=float)
     parser.add_argument('--adapt', action='store_true')
     parser.add_argument('--batch_size', default=64, type=int, help='Batch size for model predictions (default: 64)')
+    parser.add_argument('--resource_dir', required=False, type=str, default='.', help='folder with the panel of normals resource (for tumor-only mode, default: current folder)')
 
     return parser.parse_args()
 
             
 if __name__ == '__main__':
     args = parse_args()
+
+    if not args.normal_bam:
+        # tumor-only: check the panel of normals exists before running predictions
+        resource_path(args, PON_FILE)
 
     if args.ffpe and not args.vcf:
         parser.error("--vcf is required if --ffpe is provided.")
