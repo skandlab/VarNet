@@ -68,8 +68,11 @@ varnet-predict --sample_name dream1 --normal_bam dream1_normal.bam --tumor_bam d
                --reference GRCh38.fa --output_dir varnet_outputs --processes 2
 ```
 
-Note: tumor-only mode requires the Docker image, which bundles the germline filtering
-databases. The Bioconda package supports tumor-normal mode.
+To run tumor-only mode with the Bioconda package, download the germline filtering
+resources first (see [Tumor-only mode](#new-tumor-only-mode)) and pass their folder
+to both commands with `--resource_dir`.
+
+Run `varnet-filter --version` to print the installed VarNet version.
 
 ## Docker Image
 You can download the docker image from docker hub using the following command:
@@ -120,6 +123,7 @@ python filter.py \
     --reference GRCh38.fa \
     --region_bed region.bed (optional) \
     --whitelist_vcf whitelist.vcf (optional, use only in tumor-only mode) \
+    --resource_dir varnet_resources (optional, tumor-only mode, default: current folder) \
     -snv (optional flag, for snv filtering only) \
     -indel (optional flag, for indel filtering only)
 ```
@@ -133,6 +137,7 @@ python predict.py \
 	--output_dir varnet_outputs \
 	--reference GRCh38.fa \
 	--batch_size 64 (optional, default 64) \
+	--resource_dir varnet_resources (optional, tumor-only mode, default: current folder) \
 	-snv (optional flag, for snv calling only) \
 	-indel (optional flag, for indel calling only)
 ```
@@ -141,11 +146,17 @@ In this example the VarNet output VCF file will be saved to `varnet_outputs/drea
 
 ## NEW Tumor-only mode
 
-VarNet now supports a **tumor-only mode** for somatic variant detection, which uses the VarNet-T tumor-only models. **The docker image is required to run tumor-only mode.**
+VarNet now supports a **tumor-only mode** for somatic variant detection, which uses the VarNet-T tumor-only models.
 
 To run VarNet-T, simply omit the `--normal_bam` argument to run the analysis on a single tumor BAM file without a matched normal control. All commands otherwise remain the same.
 
-This function must be run using the provided latest docker image above. Germline filtering using gnomAD and dbSNP databases (included in our docker image) will be automatically performed, in addition to a panel of normals filter. 
+Germline filtering using gnomAD and dbSNP databases will be automatically performed, in addition to a panel of normals filter. These resources are included in the docker image above. With any other installation (Bioconda or the GitHub release), download them into one folder from [figshare](https://doi.org/10.6084/m9.figshare.34420128) and pass that folder to both filter.py and predict.py with `--resource_dir`:
+
+- `GrCh38-dbSNP-build-156-common-variants-0-indexed-CHROMPOS.npz` (107 MB)
+- `combined_gnomAD_v4.1_genomes_exomes_dict.hg38.chunks.npz` (3.8 GB)
+- `1000g_pon.hg38.vcf.gz` (17 MB)
+
+The results are the same as with the docker image. 
 
 📝 **Note: Tumor-only mode currently only supports the hg38 reference genome, as the gnomAD, dbSNP, and panel of normals filters are based on hg38.**
 
