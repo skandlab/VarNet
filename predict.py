@@ -96,7 +96,7 @@ def parse_predictions_batch(batch, args, mode):
         ALT_ALLELE_FRACTION_IN_TUMOR = round(ALT_ALLELE_FRACTION_IN_TUMOR, 3)
         POSITION_1_INDEXED = POS + 1
         FILTER = 'PASS' if pred_true >= 0.5 else 'REJECT'
-        INFO = 'TYPE=%s;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s;' % (mode, str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
+        INFO = 'TYPE=%s;SCORE=%s;DP=%d;RO=%d;AO=%d;AF=%s' % (mode, str(round(pred_true,4)), TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
         FORMAT = 'GT:DP:RO:AO:AF'
         SAMPLE = '0/1:%d:%d:%d:%s' % (TUMOR_DEPTH, REFERENCE_ALLELE_COUNT_IN_TUMOR, ALT_ALLELE_READ_COUNT_IN_TUMOR, str(ALT_ALLELE_FRACTION_IN_TUMOR))
 
@@ -194,14 +194,23 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
 
     fileDate = datetime.now().strftime("%Y%B%d, %H:%M:%S")
 
+    # declare contigs so tools like bcftools can write the records as BCF
+    ref = pysam.FastaFile(args.reference)
+    contig_lines = ''.join('##contig=<ID=%s,length=%d>\n' % (name, length) for name, length in zip(ref.references, ref.lengths))
+    ref.close()
+
     vcf_header =  "##fileformat=VCFv4.2\n" + \
 """##fileDate=%s
 ##source=VarNet v%s
 ##reference=%s
 ##normalBAM=%s
 ##tumorBAM=%s
-##INFO=<ID=TYPE,Number=.,Type=String,Description="Type of Somatic Event INDEL or SNV">
+%s##INFO=<ID=TYPE,Number=.,Type=String,Description="Type of Somatic Event INDEL or SNV">
 ##INFO=<ID=SCORE,Number=1,Type=Float,Description="Prediction probability score">
+##INFO=<ID=DP,Number=1,Type=Integer,Description="Read Depth in the tumor">
+##INFO=<ID=RO,Number=1,Type=Integer,Description="Reference allele observation count in the tumor">
+##INFO=<ID=AO,Number=A,Type=Integer,Description="Alternate allele observation count in the tumor">
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele fractions of alternate alleles in the tumor">
 ##FILTER=<ID=PASS,Description="Accept as somatic mutation with probability score at least 0.5">
 ##FILTER=<ID=REJECT,Description="Reject somatic mutation with probability score value below 0.5">
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
@@ -209,7 +218,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
 ##FORMAT=<ID=RO,Number=1,Type=Integer,Description="Reference allele observation count in the tumor">
 ##FORMAT=<ID=AO,Number=A,Type=Integer,Description="Alternate allele observation count in the tumor">
 ##FORMAT=<ID=AF,Number=1,Type=Float,Description="Allele fractions of alternate alleles in the tumor">
-#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n""" % (fileDate, c.__VERSION__, args.reference, args.normal_bam, args.tumor_bam)
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n""" % (fileDate, c.__VERSION__, args.reference, args.normal_bam, args.tumor_bam, contig_lines)
 
     vcf_write.write(vcf_header)
 
@@ -266,7 +275,8 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
     # sort vcf
     print('>>> Sorting VCF...')
     sorted_vcf = final_vcf.replace('.vcf.gz', '.sort.vcf')
-    os.system(f'bedtools sort -i {final_vcf} -header > {sorted_vcf} && gzip {sorted_vcf} && mv {sorted_vcf}.gz {final_vcf}')
+    # sort in reference order so records follow the declared contig order
+    os.system(f'bedtools sort -faidx {args.reference}.fai -i {final_vcf} -header > {sorted_vcf} && gzip {sorted_vcf} && mv {sorted_vcf}.gz {final_vcf}')
     print('>>> VCF sorted.')
 
     print("Output VCF:", final_vcf)
