@@ -156,6 +156,12 @@ Germline filtering using gnomAD and dbSNP databases will be automatically perfor
 - `combined_gnomAD_v4.1_genomes_exomes_dict.hg38.chunks.npz` (3.8 GB)
 - `1000g_pon.hg38.vcf.gz` (17 MB)
 
+To download them and check their md5 checksums, run `download_resources.sh` from this repo, optionally with an output folder (default: `varnet_resources`):
+
+```
+bash download_resources.sh varnet_resources
+```
+
 The results are the same as with the docker image. 
 
 📝 **Note: Tumor-only mode currently only supports the hg38 reference genome, as the gnomAD, dbSNP, and panel of normals filters are based on hg38.**
