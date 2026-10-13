@@ -571,6 +571,7 @@ def filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args
     
 def parse_args():
     parser = argparse.ArgumentParser(description="Model Predictions")
+    parser.add_argument('--version', action='version', version=f'VarNet {c.__VERSION__}')
     parser.add_argument('--path_to_positions_to_predict')
     parser.add_argument('--num_nodes')
     parser.add_argument('--node_no')

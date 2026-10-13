@@ -478,6 +478,7 @@ def check_filtering(path_to_trues, sample_name):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Filter positions")
+    parser.add_argument('--version', action='version', version=f'VarNet {c.__VERSION__}')
     parser.add_argument('--processes', default=5, type=int)
     parser.add_argument('--sample_name', required=True)
     parser.add_argument('--path_to_trues', default=None)
