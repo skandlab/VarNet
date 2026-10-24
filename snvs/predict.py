@@ -9,7 +9,7 @@ import pandas as pd
 import joblib
 from joblib import Parallel, delayed, __version__
 from snvs.filter import check_read
-from utils import get_ref_file, update_batch_norm_fn, ttt_get_models, test_time_train
+from utils import get_ref_file
 
 # Disable tf logging. 1 to filter out INFO logs, 2 to additionally filter out WARNING logs,
 # and 3 to additionally filter out ERROR logs
@@ -21,41 +21,45 @@ from snvs.generate_training_data import get_reference, generate_image, populate_
 
 CURRENT_DIR = os.path.dirname(__file__) 
 
-def get_model(args, adapted=False):
+class MainProcessModel:
+    """
+    Stands in for the model in prediction worker processes. The model is loaded only in the main process (see predict.py):
+    model(input_tensor) copies the batch into this worker's shared-memory slot and waits for the main process to return
+    the model output.
+    """
+    def connect(self, slot_buffer, slot_offset, slot_size, requests, reply, worker_id):
+        # called once in each worker process by predict.py
+        self.slot_buffer, self.slot_offset, self.slot_size = slot_buffer, slot_offset, slot_size
+        self.requests, self.reply, self.worker_id = requests, reply, worker_id
+
+    def __call__(self, input_tensor):
+        size = input_tensor.size
+        assert size <= self.slot_size, 'batch does not fit in shared memory slot'
+        slot = np.frombuffer(self.slot_buffer, dtype=np.float32, count=size, offset=self.slot_offset).reshape(input_tensor.shape)
+        slot[...] = input_tensor
+        self.requests.put((self.worker_id, input_tensor.shape))
+        return self.reply.get()
+
+main_process_model = MainProcessModel() # shared by snv and indel prediction
+
+def get_model(args):
     from tensorflow.keras.models import model_from_json
 
     if args.normal_bam and not args.ffpe:
         # frozen tumor-normal convnet2 and not ffpe
         BEST_MODEL_ARCHITECTURE_PATH = c.BEST_MODEL_ARCHITECTURE_PATH
-        BEST_MODEL_PATH = c.BEST_MODEL_PATH
         BEST_MODEL_WEIGHTS_PATH = c.BEST_MODEL_WEIGHTS_PATH
 
-        if c.TEST_TIME_TRAINING:
-            from tensorflow.keras.models import load_model
-            # for group normalization
-            # import tensorflow_addons as tfa
-            #model = model_from_json(model_architecture, custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
-            model = load_model(os.path.join(CURRENT_DIR, BEST_MODEL_PATH), custom_objects={'Addons>GroupNormalization': tfa.layers.GroupNormalization})
-            assert model.optimizer is not None
-
-        elif adapted:
-            # load adapted model
-            from tensorflow.keras.models import load_model
-            model = load_model(os.path.join(args.sample_folder, c.SNV_ADAPTED_TUMOR_NORMAL_MODEL))
-
-        else:
-            with open(os.path.join(CURRENT_DIR, BEST_MODEL_ARCHITECTURE_PATH)) as f:
-                model_architecture = f.read()
-            model = model_from_json(model_architecture)
-            model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
+        with open(os.path.join(CURRENT_DIR, BEST_MODEL_ARCHITECTURE_PATH)) as f:
+            model_architecture = f.read()
+        model = model_from_json(model_architecture)
+        model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
 
     else:
         # frozen tumor-only or ffpe
 
         # <start> tumor-only convnet2
         if args.ffpe:
-            raise Exception('which model to load?')
-        elif adapted:
             raise Exception('which model to load?')
         else:
             BEST_MODEL_ARCHITECTURE_PATH = c.TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH
@@ -85,7 +89,7 @@ def get_model(args, adapted=False):
 
     return model
 
-def predict_position(input_tensor, model, channel_means, channel_stds, training=False, args=None):
+def predict_position(input_tensor, model, channel_means, channel_stds, args=None):
     if c.MULTIPLE_READ_SAMPLES:
         raise Exception("MULTIPLE_READ_SAMPLES is True. Batch prediction requires it to be False.")
 
@@ -94,20 +98,14 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         input_tensor -= channel_means
         input_tensor /= channel_stds
 
-    if not training:
-        # full batch prediction
-        #y_pred_test = model.predict(input_tensor, batch_size=len(input_tensor))
-        y_pred_test = model(input_tensor, training=False).numpy()
+    # full batch prediction by the model in the main process
+    y_pred_test = model(input_tensor)
 
-        if y_pred_test.shape[1] != 1:
-            # multi-class output, use somatic proba only
-            y_pred_test = y_pred_test[:,1]
-            
-        return y_pred_test
-    else:
-        # to update batch norm statistics
-        y_pred_test = model(input_tensor, training=True)
-        return y_pred_test
+    if y_pred_test.shape[1] != 1:
+        # multi-class output, use somatic proba only
+        y_pred_test = y_pred_test[:,1]
+
+    return y_pred_test
 
 def get_read_starts(reads):
     read_starts = []
@@ -136,22 +134,12 @@ def subset_reads(reads, read_starts, max_read_len, fetch_start, fetch_end):
     idx_end = bisect.bisect_right(read_starts, fetch_end)
     return [r for r in reads[idx_start:idx_end] if r.reference_start < fetch_end and r.reference_end > fetch_start]
 
-def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
+def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, output_path=None):
     print(("SNV PREDICTION BATCH:", batch_num))
-    # Cap TensorFlow thread pools to prevent thread explosion in multi-process mode.
-    # Each worker is one of --processes parallel Loky processes; without caps, TF
-    # defaults to using all available cores for intra-op parallelism, spawning
-    # ~150 threads per worker (24 workers x 150 = ~3,600 threads total).
-    # Let the user override via environment, but default to 1 threads each.
-    import os as _os
-    _os.environ.setdefault('TF_NUM_INTRAOP_THREADS', '2')
-    _os.environ.setdefault('TF_NUM_INTEROP_THREADS', '2')
-
 
     bamfile_n = None
     bamfile_t = None
     ref_file = None
-    model = None
     results_list = []
 
     try:
@@ -197,9 +185,7 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
                     pos_key = 'chrom%spos%s' % (chrom, pos)
                     positions_completed[pos_key] = True
 
-        model = get_model(args, adapted=adapted)
-
-        assert model is not None
+        model = main_process_model
 
         if args.normal_bam and not args.ffpe:
             # tumor-normal frozen
@@ -228,14 +214,6 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
         for i, row in positions_iterator:
             positions.append((row['pos'], row['chrom'], row['REF'], row['ALT'], row['DP'], row['RO'], row['AO'], row['AF']))
 
-        if getattr(args, 'update_batch_norm', False):
-            update_batch_norm_fn(model, positions, bamfile_n, bamfile_t, channel_means, channel_stds, ref_file=ref_file, create_input_fn=create_input_tensor_for_position, predict_fn=predict_position)
-
-        if c.TEST_TIME_TRAINING:
-            classifier_head, self_supervised_head = ttt_get_models(model, lr=0.0001)
-            import random
-            random.shuffle(positions) # shuffle positions for TTT
-
         batch_size = getattr(args, 'batch_size', 64)
         for i in range(0, len(positions), batch_size):
             batch = positions[i:i + batch_size]
@@ -262,19 +240,11 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
                 # filter tumor
                 current_tumor_reads = subset_reads(tumor_reads, tumor_read_starts, tumor_max_read_len, fetch_start, fetch_end)
 
-                if c.TEST_TIME_TRAINING:
-                    input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
-                    test_time_train(self_supervised_head, input_tensor, channel_means, channel_stds)
-                    pred_true = predict_position(input_tensor, classifier_head, channel_means, channel_stds, args=args)
-                    pred_true = float(pred_true[0])
+                input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
+                batch_input_tensors.append(input_tensor)
+                batch_metadata.append(row)
 
-                    results_list.append({'chrom': chrom, 'pos': pos, 'REF': REF, 'ALT': ALT, 'DP': DP, 'RO': RO, 'AO': AO, 'AF': AF, 'pred_true': pred_true})
-                else:
-                    input_tensor = create_input_tensor_for_position(chrom, pos, bamfile_n, bamfile_t, ref_file, normal_reads=current_normal_reads, tumor_reads=current_tumor_reads)
-                    batch_input_tensors.append(input_tensor)
-                    batch_metadata.append(row)
-
-            if not c.TEST_TIME_TRAINING and batch_input_tensors:
+            if batch_input_tensors:
                 input_tensor_batch = np.concatenate(batch_input_tensors, axis=0)
                 preds = predict_position(input_tensor_batch, model, channel_means, channel_stds, args=args)
 
@@ -309,9 +279,4 @@ def predict_snvs(positions_to_predict, batch_num, args, snv_predictions_folder, 
             bamfile_t.close()
         if ref_file:
             ref_file.close()
-        # Free TensorFlow/Keras session resources
-        if model is not None:
-            del model
-        from tensorflow.keras import backend as K
-        K.clear_session()
         gc.collect()

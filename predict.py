@@ -9,20 +9,24 @@ import os
 import sys
 import gc
 import gzip
+import mmap
+import queue
+import multiprocessing as mp
 
 # Disable tf logging. 1 to filter out INFO logs, 2 to additionally filter out WARNING logs,
 # and 3 to additionally filter out ERROR logs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 from filter import create_folder, resource_path
-from utils import get_ref_file
 
 import snvs.constants as c
 from snvs.generate_training_data import get_ref_base
 from snvs.filter import check_read, get_snv
-from snvs.predict import predict_snvs
+from snvs.predict import predict_snvs, get_model as get_snv_model, main_process_model
+import snvs.constants as snv_c
 from indels.filter import get_indels
-from indels.predict import predict_indels
+from indels.predict import predict_indels, get_model as get_indel_model
+import indels.constants as indel_c
 
 def get_coverage(bamfile, chrom, ref_pos):
     coverage = bamfile.count_coverage(chrom, ref_pos, ref_pos+1)#, quality_threshold=c.MIN_BASE_QUALITY, read_callback=check_read)
@@ -174,12 +178,12 @@ def concatenate_batch_prediction_results(predictions_folder):
 
 PON_FILE = '1000g_pon.hg38.vcf.gz'
 
-def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=False):
+def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args):
     from datetime import datetime
 
     # reference file handle is now opened within parallel parsing workers
 
-    output_vcf = os.path.join(sample_folder, args.sample_name + f'{".adapted" if adapted else ""}.vcf.gz')
+    output_vcf = os.path.join(sample_folder, args.sample_name + '.vcf.gz')
 
     if os.path.exists(output_vcf):
         print("VCF file exists for sample. Delete the VCF to re-generate in current output dir.")
@@ -244,7 +248,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
     # BAM handles are now opened within parallel parsing workers
 
     if not args.indel: # if not indel only
-        snv_df = pd.read_csv(snv_predictions_file, sep='\t', header=None)
+        snv_df = pd.read_csv(snv_predictions_file, sep='\t', header=None, dtype={0: str}) # read chrom as str, numeric chrom names (e.g. GRCh37 '1') are otherwise read as int, which pysam rejects
         snv_df = snv_df[snv_df[8] >= CUT_OFF]
         if len(snv_df) > 0:
             batches = np.array_split(snv_df, min(len(snv_df), args.processes * 4))
@@ -254,7 +258,7 @@ def make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, 
                     vcf_write.write(line)
 
     if not args.snv: # if not snv only
-        indel_df = pd.read_csv(indel_predictions_file, sep='\t', header=None)
+        indel_df = pd.read_csv(indel_predictions_file, sep='\t', header=None, dtype={0: str}) # read chrom as str, numeric chrom names (e.g. GRCh37 '1') are otherwise read as int, which pysam rejects
         indel_df = indel_df[indel_df[8] >= CUT_OFF]
         if len(indel_df) > 0:
             batches = np.array_split(indel_df, min(len(indel_df), args.processes * 4))
@@ -390,7 +394,95 @@ def parse_vcf(vcf_file, filename, snv=True, PASS_only=True):
 
     print('Extracted', count, 'SNVs' if snv else 'indels', 'from', vcf_file)
 
-def main(adapted=False):
+""" SINGLE MODEL INFERENCE
+
+Worker processes generate the input tensors (predict_snvs/predict_indels) and the main process holds the only
+copy of the model. Each worker has its own shared-memory slot of args.batch_size tensors: it copies a normalized
+batch into the slot, sends a request and waits for the model output (snvs.predict.MainProcessModel). Workers are
+forked before tensorflow is imported, so they never load tensorflow or the model.
+"""
+
+def _init_worker(server, worker_ids):
+    worker_id = worker_ids.get()
+    main_process_model.connect(server.buffer, worker_id * server.slot_size * 4, server.slot_size, server.requests, server.replies[worker_id], worker_id)
+
+class InferenceServer:
+    def __init__(self, args):
+        ctx = mp.get_context('fork')
+        self.processes = args.processes
+
+        # one slot per worker, large enough for a batch of the larger of the snv and indel input tensors
+        self.slot_size = args.batch_size * max(int(np.prod(snv_c.INPUT_SHAPE)), int(np.prod(indel_c.INPUT_SHAPE))) # float32 values
+        self.buffer = mmap.mmap(-1, self.processes * self.slot_size * 4) # anonymous shared memory, pages allocated when written
+
+        self.requests = ctx.Queue()
+        self.replies = [ctx.SimpleQueue() for _ in range(self.processes)]
+
+        worker_ids = ctx.SimpleQueue()
+        for i in range(self.processes):
+            worker_ids.put(i)
+
+        self.pool = ctx.Pool(self.processes, initializer=_init_worker, initargs=(self, worker_ids))
+        self.worker_pids = {p.pid for p in self.pool._pool}
+        self.device = None
+
+    def slot(self, worker_id, shape):
+        size = int(np.prod(shape))
+        assert size <= self.slot_size, 'batch does not fit in shared memory slot'
+        return np.frombuffer(self.buffer, dtype=np.float32, count=size, offset=worker_id * self.slot_size * 4).reshape(shape)
+
+    def setup_device(self):
+        """Use the first GPU if available (one model copy only needs one), else CPU."""
+        if self.device is not None:
+            return
+
+        # Cap TensorFlow thread pools to prevent thread explosion (and out-of-memory issues): without caps, TF
+        # defaults to using all available cores for intra-op parallelism. Let the user override via environment.
+        os.environ.setdefault('TF_NUM_INTRAOP_THREADS', '2')
+        os.environ.setdefault('TF_NUM_INTEROP_THREADS', '2')
+
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices('GPU')
+
+        if gpus:
+            tf.config.set_visible_devices(gpus[0], 'GPU')
+            # allocate GPU memory as needed instead of reserving all of it
+            tf.config.experimental.set_memory_growth(gpus[0], True)
+            self.device = gpus[0].name
+        else:
+            self.device = 'CPU'
+
+        print('>>> Model inference device:', self.device)
+
+    def run(self, predict_fn, tasks, get_model):
+        """Run predict_fn(*task) in the workers while serving their model requests."""
+        self.setup_device()
+        model = get_model(args)
+
+        result = self.pool.starmap_async(predict_fn, tasks, chunksize=1)
+
+        while not result.ready():
+            try:
+                worker_id, shape = self.requests.get(timeout=1)
+            except queue.Empty:
+                if {p.pid for p in self.pool._pool} != self.worker_pids:
+                    raise RuntimeError('Prediction worker process terminated unexpectedly (e.g. out of memory).')
+                continue
+
+            y_pred = model(self.slot(worker_id, shape), training=False).numpy()
+            self.replies[worker_id].put(y_pred)
+
+        result.get() # raise worker exceptions
+
+        del model
+        from tensorflow.keras import backend as K
+        K.clear_session()
+
+    def close(self):
+        self.pool.close()
+        self.pool.join()
+
+def main():
     if args.ffpe:
         # extract candidates from args.vcf
         candidates_folder = os.path.join(sample_folder, c.sample_candidates_folder)
@@ -452,7 +544,7 @@ def main(adapted=False):
             snv_candidate_batches = split_candidates_into_batches(snv_candidates)
 
             try:
-                Parallel(n_jobs=int(args.processes))( delayed(predict_snvs)(batch, idx, args, snv_predictions_folder, adapted=adapted) for idx, batch in enumerate(snv_candidate_batches) )
+                inference_server.run(predict_snvs, [(batch, idx, args, snv_predictions_folder) for idx, batch in enumerate(snv_candidate_batches)], get_snv_model)
             except KeyboardInterrupt as e:
                 print(('workerinterrupt', e))
 
@@ -487,7 +579,7 @@ def main(adapted=False):
             indel_candidate_batches = split_candidates_into_batches(indel_candidates, max_dist=250000)
 
             try:
-                Parallel(n_jobs=int(args.processes))( delayed(predict_indels)(batch, idx, args, indel_predictions_folder, adapted=adapted) for idx, batch in enumerate(indel_candidate_batches) )
+                inference_server.run(predict_indels, [(batch, idx, args, indel_predictions_folder) for idx, batch in enumerate(indel_candidate_batches)], get_indel_model)
             except KeyboardInterrupt as e:
                 print(('workerinterrupt', e))
 
@@ -499,7 +591,7 @@ def main(adapted=False):
         filter_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
     else:
         """ MAKE VCF FILE """
-        make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args, adapted=adapted)
+        make_vcf(sample_folder, snv_predictions_file, indel_predictions_file, args)
 
     return snv_predictions_file, indel_predictions_file
 
@@ -591,12 +683,10 @@ def parse_args():
     parser.add_argument('-snv', action='store_true') # read as snv_only
     parser.add_argument('-indel', action='store_true') # read as indel_only
 
-    parser.add_argument('--update_batch_norm', default=False) # update batch norm stats for test sample
     parser.add_argument('--ffpe', action='store_true') # for FFPE samples, must provide VCF
     parser.add_argument('--vcf', default=False, type=str, help='VCF file for FFPE prediction') # for FFPE samples, must provide VCF
 
     parser.add_argument('--threshold', default=None, type=float)
-    parser.add_argument('--adapt', action='store_true')
     parser.add_argument('--batch_size', default=64, type=int, help='Batch size for model predictions (default: 64)')
     parser.add_argument('--resource_dir', required=False, type=str, default='.', help='folder with the panel of normals resource (for tumor-only mode, default: current folder)')
 
@@ -645,29 +735,14 @@ if __name__ == '__main__':
     if (os.path.exists(output_vcf) or os.path.exists(output_vcf + '.gz')):
         print("VCF file exists for sample. Use new output_dir to re-run sample or delete the VCF to re-generate in current output dir.")
         print(("VCF:", output_vcf))
-    else: 
+    else:
+        # single model in the main process. created before tensorflow is imported so the forked workers do not carry it
+        inference_server = InferenceServer(args)
+
         # call main() function
         main()
 
-    if args.adapt:
-        # fine-tune varnet on test samples
-        from adapt import adapt
-        snv_predictions_file = os.path.join(sample_folder, c.sample_predictions_folder, c.snv_candidates_folder, c.combined_predictions_file)
-        indel_predictions_file = os.path.join(sample_folder, c.sample_predictions_folder, c.indel_candidates_folder, c.combined_predictions_file)
-    
-        if not args.indel:
-            # do snv
-            adapt(sample_folder, snv_predictions_file, args, get_ref_file(args.reference), snv=True)
-        
-        if not args.snv:
-            # do indel
-            adapt(sample_folder, indel_predictions_file, args, get_ref_file(args.reference), snv=False)
-
-        # reset sample predictions folder name for adaptive predictions
-        c.sample_predictions_folder = 'adapted_predictions'
-        
-        # call main function again
-        main(adapted=True)
+        inference_server.close()
 
 else:
     ref_path = c.ref_path_on_aquila

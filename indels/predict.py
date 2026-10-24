@@ -25,9 +25,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import indels.constants as c
 from indels.generate_training_data_specialized import create_input_tensor_for_position, get_start, get_end
 from snvs.generate_training_data import create_tumor_only_input_tensor_for_position, get_reads
-from snvs.predict import subset_reads
+from snvs.predict import subset_reads, main_process_model
 
-from utils import get_ref_file, update_batch_norm_fn
+from utils import get_ref_file
 
 CURRENT_DIR = os.path.dirname(__file__)
 
@@ -47,7 +47,7 @@ if __name__ == '__main__':
     args = parse_args()
     predictions_folder = c.predictions_folder
 
-def get_model(args, adapted=False):
+def get_model(args):
     from tensorflow.keras.models import model_from_json
 
     if args.normal_bam and not args.ffpe:
@@ -60,18 +60,11 @@ def get_model(args, adapted=False):
         model = model_from_json(model_architecture)
         model.load_weights(os.path.join(CURRENT_DIR, BEST_MODEL_WEIGHTS_PATH))
 
-    elif adapted:
-        # load adapted model
-        from tensorflow.keras.models import load_model
-        model = load_model(os.path.join(args.sample_folder, c.INDEL_ADAPTED_TUMOR_NORMAL_MODEL))
-
     else:
         # frozen tumor-only or ffpe
 
         # <start> tumor-only convnet
         if args.ffpe:
-            raise Exception('which model to load?')
-        elif adapted:
             raise Exception('which model to load?')
         else:
             BEST_MODEL_ARCHITECTURE_PATH = c.TUMOR_ONLY_BEST_MODEL_ARCHITECTURE_PATH
@@ -101,7 +94,7 @@ def get_model(args, adapted=False):
 
     return model
 
-def predict_position(input_tensor, model, channel_means, channel_stds, training=False, args=None):
+def predict_position(input_tensor, model, channel_means, channel_stds, args=None):
     if c.MULTIPLE_READ_SAMPLES:
         raise Exception("MULTIPLE_READ_SAMPLES is True. Batch prediction requires it to be False.")
 
@@ -113,17 +106,10 @@ def predict_position(input_tensor, model, channel_means, channel_stds, training=
         input_tensor -= channel_means
         input_tensor /= channel_stds
 
-    if not training:
-        # full batch prediction
-        #y_pred_test = model.predict(input_tensor, batch_size=len(input_tensor))
-        y_pred_test = model(input_tensor, training=False).numpy()
+    # full batch prediction by the model in the main process
+    y_pred_test = model(input_tensor)
 
-        return y_pred_test
-
-    else:
-        # to update batch norm statistics
-        y_pred_test = model(input_tensor, training=True)
-        return y_pred_test
+    return y_pred_test
 
 def get_read_starts(reads):
     read_starts = []
@@ -141,18 +127,12 @@ def get_read_starts(reads):
     
     return read_starts, max_read_len
 
-def predict_indels(positions_to_predict, batch_num, args, indel_predictions_folder, output_path=None, update_batch_norm=False, adapted=False):
+def predict_indels(positions_to_predict, batch_num, args, indel_predictions_folder, output_path=None):
     print(("INDEL PREDICTION BATCH:", batch_num))
-    # Cap TensorFlow thread pools to prevent thread explosion in multi-process mode.
-    import os as _os
-    _os.environ.setdefault('TF_NUM_INTRAOP_THREADS', '2')
-    _os.environ.setdefault('TF_NUM_INTEROP_THREADS', '2')
-
 
     bamfile_n = None
     bamfile_t = None
     ref_file = None
-    model = None
     results_list = []
 
     try:
@@ -201,8 +181,7 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
         tumor_reads = get_reads(bamfile_t, positions_to_predict['chrom'].values[0], region_start, region_end)
         tumor_read_starts, tumor_max_read_len = get_read_starts(tumor_reads)
 
-        model = get_model(args, adapted=adapted)
-        assert model is not None
+        model = main_process_model
 
         positions_iterator = positions_to_predict.iterrows()
         positions = []
@@ -229,9 +208,6 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
             # < set to None for transformer, no need normalization>
             # channel_means, channel_stds = None, None
             # </ set to None for transformer, no need normalization>
-
-        if getattr(args, 'update_batch_norm', False):
-            update_batch_norm_fn(model, positions, bamfile_n, bamfile_t, channel_means, channel_stds, ref_file=ref_file, create_input_fn=create_input_tensor_for_position, predict_fn=predict_position)
 
         batch_size = getattr(args, 'batch_size', 64)
         for i in range(0, len(positions), batch_size):
@@ -307,11 +283,6 @@ def predict_indels(positions_to_predict, batch_num, args, indel_predictions_fold
             bamfile_t.close()
         if ref_file:
             ref_file.close()
-        # Free TensorFlow/Keras session resources
-        if model is not None:
-            del model
-        from tensorflow.keras import backend as K
-        K.clear_session()
         gc.collect()
 
 def concatenate_batch_prediction_results(predictions_folder):
