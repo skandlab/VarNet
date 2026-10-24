@@ -621,4 +621,4 @@ def set_experiment_name(experiment_name):
 
 set_experiment_name(experiment_name)
 
-__VERSION__ = '1.5.4'
+__VERSION__ = '1.5.5'
